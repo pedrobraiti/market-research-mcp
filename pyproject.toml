@@ -1,5 +1,5 @@
 [project]
-name = "mcp-market-research"
+name = "market-research-mcp"
 version = "0.5.4"
 description = "Scout — an MCP server that gathers and structures financial data for AI trading agents (snapshots, fundamentals, dividends, and more). Stateless; pairs with agentic-trading-mcp."
 readme = "README.md"
@@ -26,7 +26,7 @@ dev = [
 ]
 
 [project.scripts]
-mcp-market-research = "scout.server.app:main"
+market-research-mcp = "scout.server.app:main"
 scout-healthcheck = "scout.healthcheck:main"
 
 [build-system]

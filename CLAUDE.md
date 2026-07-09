@@ -2,7 +2,7 @@
 
 ## Sobre o projeto (leitura rápida)
 
-`mcp-market-research` (nome amigável **Scout**) é um **MCP server de coleta e análise de dados financeiros** para agentes de IA — a camada de **sentidos**. Faz par com o `agentic-trading-mcp` (**Valet**, execução — monorepo com dois servidores MCP: `ibkr` para ações/ETFs e `crypto` para spot via CCXT). O **cérebro é o Claude Code**: ele raciocina e decide; a estratégia mora numa **skill** única dirigida por linguagem natural (**Vizier**, `/vizier`), não em código. Este repo entrega só os **dados** (tools gordas, com paralelismo interno) e não envia ordens. Repo **público**, docs em inglês, **sem segredos versionados**, fontes de dados **gratuitas** primeiro. Detalhes em `.claude/context.md` e `.claude/decisions.md`.
+`market-research-mcp` (nome amigável **Scout**) é um **MCP server de coleta e análise de dados financeiros** para agentes de IA — a camada de **sentidos**. Faz par com o `agentic-trading-mcp` (**Valet**, execução — monorepo com dois servidores MCP: `ibkr` para ações/ETFs e `crypto` para spot via CCXT). O **cérebro é o Claude Code**: ele raciocina e decide; a estratégia mora numa **skill** única dirigida por linguagem natural (**Vizier**, `/vizier`), não em código. Este repo entrega só os **dados** (tools gordas, com paralelismo interno) e não envia ordens. Repo **público**, docs em inglês, **sem segredos versionados**, fontes de dados **gratuitas** primeiro. Detalhes em `.claude/context.md` e `.claude/decisions.md`.
 
 ## Memória persistente
 

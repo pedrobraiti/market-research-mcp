@@ -48,8 +48,8 @@ command differs.
 
 ```bash
 # 1. Install
-git clone https://github.com/pedrobraiti/mcp-market-research.git
-cd mcp-market-research
+git clone https://github.com/pedrobraiti/market-research-mcp.git
+cd market-research-mcp
 python -m venv .venv
 # Windows (PowerShell): & ".venv\Scripts\Activate.ps1"   (on a policy error: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass)
 # Linux/macOS:          source .venv/bin/activate
@@ -59,8 +59,8 @@ pip install -e .
 cp .env.example .env      # then set SCOUT_SEC_USER_AGENT="Your Name your@email.com"
 
 # 3. Register the MCP with Claude Code (use the venv's python — absolute path)
-#   Windows:      claude mcp add scout -- "C:\path\to\mcp-market-research\.venv\Scripts\python.exe" -m scout.server.app
-#   Linux/macOS:  claude mcp add scout -- /path/to/mcp-market-research/.venv/bin/python -m scout.server.app
+#   Windows:      claude mcp add scout -- "C:\path\to\market-research-mcp\.venv\Scripts\python.exe" -m scout.server.app
+#   Linux/macOS:  claude mcp add scout -- /path/to/market-research-mcp/.venv/bin/python -m scout.server.app
 ```
 
 The tools then appear to the agent (in Claude Code, a **new** session). Verify the data layer works

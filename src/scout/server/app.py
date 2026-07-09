@@ -42,7 +42,7 @@ def services() -> Services:
     return _services
 
 
-mcp = FastMCP("mcp-market-research")
+mcp = FastMCP("market-research-mcp")
 
 
 def _ok(data: Any) -> dict:
