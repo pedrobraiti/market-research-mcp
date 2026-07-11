@@ -303,6 +303,13 @@ class PriceHistory(BaseModel):
     interval: str
     bars: list[PriceBar] = []
     as_of: date | None = None
+    source: str | None = Field(
+        default=None,
+        description=(
+            "Which upstream actually served the bars (e.g. 'yfinance' / 'stooq') — set by the "
+            "fallback wrapper so downstream provenance claims stay honest. None = not stamped."
+        ),
+    )
 
 
 class Technicals(BaseModel):
@@ -524,6 +531,14 @@ class RelativeStrengthRow(BaseModel):
     symbol: str
     return_percent: Decimal | None = None
     excess_vs_benchmark: Decimal | None = None
+    window_start: date | None = Field(
+        default=None,
+        description=(
+            "First bar actually used for this symbol's return. A recent IPO has less history "
+            "than the requested period — its window starts later than the benchmark's, so its "
+            "return is NOT measured over the same span. Compare before ranking."
+        ),
+    )
     note: str | None = None
 
 
@@ -533,6 +548,7 @@ class RelativeStrength(BaseModel):
     benchmark: str
     period: str
     benchmark_return_percent: Decimal | None = None
+    benchmark_window_start: date | None = None  # first bar used for the benchmark's return
     rows: list[RelativeStrengthRow] = []
     notes: list[str] = []
 

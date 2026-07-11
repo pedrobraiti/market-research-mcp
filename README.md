@@ -10,10 +10,11 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/pedrobraiti/market-research-mcp/actions/workflows/ci.yml"><img src="https://github.com/pedrobraiti/market-research-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.12%2B-blue" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT">
   <img src="https://img.shields.io/badge/tools-62-orange" alt="62 tools">
-  <img src="https://img.shields.io/badge/status-live--validated-success" alt="Status: live-validated">
+  <a href="src/scout/healthcheck.py"><img src="https://img.shields.io/badge/status-live--validated-success" alt="Status: live-validated (verify anytime: python -m scout.healthcheck AAPL)"></a>
 </p>
 
 > **Not financial advice.** A research and data-gathering tool. It does **not** place orders and
@@ -68,6 +69,34 @@ at any time, independent of any agent:
 
 ```bash
 python -m scout.healthcheck AAPL   # live smoke test (fetches a real quote)
+```
+
+Every tool answers with the same `{"ok": ..., "data": ...}` envelope. `company_snapshot("AAPL")`,
+for example, returns:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "symbol": "AAPL",
+    "name": "Apple Inc.",
+    "currency": "USD",
+    "price": "230.0",
+    "previous_close": "228.0",
+    "change": "2.0",
+    "change_percent": "0.877193",
+    "market_cap": "3500000000000",
+    "pe_ratio": "35.5",
+    "forward_pe": "30.1",
+    "dividend_yield": "0.0044",
+    "fifty_two_week_high": "260.1",
+    "fifty_two_week_low": "164.0",
+    "sector": "Technology",
+    "industry": "Consumer Electronics",
+    "market_state": "REGULAR",
+    "recent_splits": []
+  }
+}
 ```
 
 Then just ask the agent in natural language — e.g. *"Use the scout tools to do the most complete
@@ -212,9 +241,13 @@ Paid free-tiers (Finnhub/FMP) are pluggable behind the same ports if ever wanted
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 145 offline tests
+pytest -q          # 267 offline tests (fixtures faithful to the real source payloads)
 ruff check .       # lint
 ```
+
+The suite includes a smoke test of the **real MCP stdio transport** (it spawns
+`python -m scout.server.app` and drives it as an MCP client) — a class of bug that only reproduces
+over the actual transport, never through the service layer, is caught there.
 
 ## License
 

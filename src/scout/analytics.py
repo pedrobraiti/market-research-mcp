@@ -12,8 +12,6 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from .domain.models import PriceHistory, Technicals
 
-_WEEK52_BARS = 252  # ~ one trading year
-
 
 def sma(values: list[float], window: int) -> float | None:
     if len(values) < window:
@@ -410,16 +408,19 @@ def trailing_negative_run(values: list[float]) -> int:
 
 def sahm_gap(monthly_unemployment: list[float]) -> float | None:
     """Sahm recession gap: current 3-month average unemployment minus the minimum of that
-    same 3-month average over the trailing 12 months. ≥ 0.50 p.p. has historically marked the
-    start of a US recession. Needs at least 4 monthly points (oldest→newest)."""
+    same 3-month average over the PREVIOUS 12 months — excluding the current month, per the
+    official definition (FRED SAHMREALTIME). Including the current month would clamp the gap
+    at ≥ 0 forever: falling unemployment could never print negative. ≥ 0.50 p.p. has
+    historically marked the start of a US recession. Needs at least 4 monthly points
+    (oldest→newest)."""
     if len(monthly_unemployment) < 4:
         return None
     ma3 = [
         sum(monthly_unemployment[i - 2 : i + 1]) / 3 for i in range(2, len(monthly_unemployment))
     ]
-    if not ma3:
+    if len(ma3) < 2:
         return None
-    return ma3[-1] - min(ma3[-12:])
+    return ma3[-1] - min(ma3[-13:-1])
 
 
 def recession_probit(spread_10y_3m: float) -> float:
@@ -453,8 +454,14 @@ def compute_technicals(
     Yang-Zhang when gaps exist (equities), Rogers-Satchell for gapless 24/7 markets (crypto).
     """
     closes = [float(b.close) for b in history.bars if b.close is not None]
-    highs = [float(b.high) for b in history.bars if b.high is not None]
-    lows = [float(b.low) for b in history.bars if b.low is not None]
+    # ATR pairs high/low/close PER BAR, so the three series must come from the same bars.
+    # Filtering each independently can produce equal-length but row-shifted series (one bar
+    # missing only its high, another only its low) → a confidently wrong ATR.
+    hlc = [
+        (float(b.high), float(b.low), float(b.close))
+        for b in history.bars
+        if None not in (b.high, b.low, b.close)
+    ]
     aligned = [
         (float(b.open), float(b.high), float(b.low), float(b.close))
         for b in history.bars
@@ -466,14 +473,17 @@ def compute_technicals(
     closes_a = [b[3] for b in aligned]
 
     macd_value, signal_value, histogram = macd(closes)
-    recent = history.bars[-_WEEK52_BARS:]
+    # 52 weeks = one YEAR of bars, and a year is ``periods_per_year`` bars — 252 trading days
+    # for equities, 365 for 24/7 crypto. A hardcoded 252 would silently make crypto's "52w"
+    # range a ~36-week one (same mislabel _momentum_lookbacks guards against).
+    recent = history.bars[-periods_per_year:]
     high52 = max((float(b.high) for b in recent if b.high is not None), default=None)
     low52 = min((float(b.low) for b in recent if b.low is not None), default=None)
 
     returns = pct_returns(closes)
     last_price = closes[-1] if closes else None
     sma_200 = sma(closes, 200)
-    atr_14 = atr(highs, lows, closes, 14)
+    atr_14 = atr([b[0] for b in hlc], [b[1] for b in hlc], [b[2] for b in hlc], 14)
     mayer = last_price / sma_200 if last_price and sma_200 and sma_200 > 0 else None
     if overnight_gaps:
         ohlc_vol = yang_zhang_volatility(opens_a, highs_a, lows_a, closes_a, periods_per_year)

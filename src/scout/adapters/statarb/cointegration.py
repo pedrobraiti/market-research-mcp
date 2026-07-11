@@ -80,19 +80,23 @@ class CointegrationAnalyzer:
     def __init__(self, fetch_history: FetchHistory) -> None:
         self._fetch_history = fetch_history
 
-    async def _leg(self, symbol: str) -> tuple[dict[date, float], str | None]:
+    async def _leg(self, symbol: str) -> tuple[dict[date, float], str | None, str | None]:
+        """Fetch one symbol → (closes by date, unavailability status, price source).
+        The source (``PriceHistory.source``, stamped by the fallback wrapper) rides along so the
+        result's provenance note can say which upstream actually served each leg."""
         try:
             history = await self._fetch_history(symbol)
         except Exception as exc:  # noqa: BLE001 — a fetch error is honest unavailability, not data
-            return {}, unavailable_status(exc)
-        return _closes_by_date(history), None
+            return {}, unavailable_status(exc), None
+        source = history.source if history is not None else None
+        return _closes_by_date(history), None, source
 
     async def get_cointegration(
         self, symbol_a: str, symbol_b: str, lookback_days: int = _DEFAULT_LOOKBACK
     ) -> Cointegration:
         lookback = max(_MIN_OBS, lookback_days)
-        closes_a, status_a = await self._leg(symbol_a)
-        closes_b, status_b = await self._leg(symbol_b)
+        closes_a, status_a, source_a = await self._leg(symbol_a)
+        closes_b, status_b, source_b = await self._leg(symbol_b)
 
         statuses = [
             f"{label} {status}"
@@ -141,11 +145,20 @@ class CointegrationAnalyzer:
             if lookback_days < _MIN_OBS
             else ""
         )
+        # Provenance must reflect what actually happened: the price path falls back to stooq
+        # when yfinance is unavailable, and stooq closes are a different adjusted series.
+        if "stooq" in {source_a, source_b}:
+            source_note = (
+                f"Price sources: {result.symbol_a}={source_a or 'yfinance'}, "
+                f"{result.symbol_b}={source_b or 'yfinance'} — at least one leg came from the "
+                "stooq fallback, not yfinance's split/div-adjusted closes."
+            )
+        else:
+            source_note = "Uses yfinance split/div-adjusted closes."
         result.note = (
             f"{floor}Engle-Granger two-step: OLS hedge ratio then a non-augmented (0-lag) "
             "Dickey-Fuller test on the residual; adf_stat is judged against MacKinnon asymptotic "
-            "critical values (constant, no trend, one regressor). Uses yfinance split/div-adjusted "
-            "closes."
+            f"critical values (constant, no trend, one regressor). {source_note}"
         )
         return result
 
@@ -166,7 +179,7 @@ class CointegrationAnalyzer:
         closes: dict[str, dict[date, float]] = {}
         dropped: list[str] = []
         for symbol in clamped:
-            series, status = await self._leg(symbol)
+            series, status, _source = await self._leg(symbol)
             if status or not series:
                 dropped.append(f"{symbol} {status}" if status else f"{symbol} (no data)")
             else:

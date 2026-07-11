@@ -796,7 +796,7 @@ async def crypto_price_history(
 
 @mcp.tool()
 async def crypto_technicals(symbol: str, as_of: str | None = None) -> dict:
-    """Technical indicators for a crypto pair, computed from ~300 daily candles.
+    """Technical indicators for a crypto pair, computed from ~400 daily candles.
 
     Same indicator set as the equities `technicals` tool plus the derived risk/momentum layer
     (volatility, ATR%, 52w range position, Mayer Multiple price/SMA200, Sharpe/Sortino/Calmar,
@@ -811,8 +811,10 @@ async def crypto_technicals(symbol: str, as_of: str | None = None) -> dict:
     if svc.crypto_market_data is None:
         return _err(ValueError("Crypto market data is not configured."))
     try:
+        # 400 daily candles (> 365 = one 24/7 year + margin): enough for the 52-week range AND
+        # for momentum_12m/momentum_12_1 to populate — 300 left them structurally null.
         history = await svc.crypto_market_data.get_price_history(
-            symbol, "1d", 300, _parse_as_of(as_of)
+            symbol, "1d", 400, _parse_as_of(as_of)
         )
         if history is None or not history.bars:
             return _ok(None)

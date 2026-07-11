@@ -183,6 +183,15 @@ def test_sahm_gap_rising_unemployment():
     assert sahm_gap([4.0, 4.0, 4.0]) is None  # needs at least 4 months
 
 
+def test_sahm_gap_falling_unemployment_is_negative():
+    # Official definition (SAHMREALTIME): current 3m MA minus the min of the PREVIOUS 12
+    # months' 3m MA. Including the current month in the min clamps the gap at ≥ 0 — a falling
+    # labour market could never print an improving (negative) gap.
+    falling = [4.6, 4.5, 4.4, 4.3, 4.2, 4.1, 4.0, 3.9, 3.8, 3.7, 3.6, 3.5]
+    gap = sahm_gap(falling)
+    assert gap is not None and gap < 0
+
+
 def test_recession_probit_monotonic_and_bounded():
     inverted = recession_probit(-1.0)  # inverted curve → higher recession odds
     steep = recession_probit(2.5)  # steep curve → low odds
@@ -227,6 +236,19 @@ def test_compute_technicals_short_series_partial():
     assert tech.bars_used == 10
 
 
+def test_compute_technicals_atr_aligns_high_low_close_per_bar():
+    # Three trailing bars each missing a DIFFERENT field: filtering highs/lows/closes
+    # independently yields equal-length but ROW-SHIFTED series → a silently wrong ATR on this
+    # constant-range-2 ramp. ATR must pair high/low/close from the SAME bar, dropping any
+    # partial bar — the remaining bars are gap-free, so the true ATR is exactly 2.
+    history = _ramp_history(60)
+    history.bars[-3].high = None
+    history.bars[-2].low = None
+    history.bars[-1].close = None
+    tech = compute_technicals(history)
+    assert tech.atr_14 == Decimal("2")
+
+
 def test_compute_technicals_populates_derived_layer():
     tech = compute_technicals(_ramp_history(260))
     assert tech.volatility_annualized is not None
@@ -247,3 +269,14 @@ def test_compute_technicals_crypto_calibration():
     tech = compute_technicals(_ramp_history(260), periods_per_year=365, overnight_gaps=False)
     assert tech.annualization_factor == 365
     assert tech.volatility_estimator == "rogers_satchell"  # no overnight gap in 24/7 markets
+
+
+def test_compute_technicals_crypto_week52_and_momentum_use_365_bars():
+    # 380 daily crypto bars (ramp 1..380). "52 weeks" in a 24/7 market is 365 BARS, not 252:
+    # a hardcoded 252 makes week52_low the low of bar 129 (= 128) — a ~36-week range
+    # confidently labelled 52w. And a full crypto year present → momentum_12m must populate.
+    tech = compute_technicals(_ramp_history(380), periods_per_year=365, overnight_gaps=False)
+    assert tech.week52_high == Decimal("381")  # high of the last bar
+    assert tech.week52_low == Decimal("15")  # low of bar 16, the first of the last 365
+    assert tech.momentum_12m is not None  # closes[-1]/closes[-366] − 1
+    assert tech.momentum_12_1 is not None

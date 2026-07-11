@@ -25,6 +25,18 @@ def _total_return_pct(history) -> Decimal | None:
     return pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def _window_start(history) -> date | None:
+    """First priced bar actually used — the EFFECTIVE window start. A short-history symbol
+    (recent IPO) covers less than the requested period; annotating the start date keeps its
+    return from silently posing as period-comparable to the benchmark's."""
+    if history is None:
+        return None
+    for bar in history.bars:
+        if bar.close is not None:
+            return bar.date
+    return None
+
+
 async def build_relative_strength(
     source: MarketDataSource,
     symbols: list[str],
@@ -58,11 +70,15 @@ async def build_relative_strength(
         )
         rows.append(
             RelativeStrengthRow(
-                symbol=symbol, return_percent=symbol_return, excess_vs_benchmark=excess
+                symbol=symbol,
+                return_percent=symbol_return,
+                excess_vs_benchmark=excess,
+                window_start=_window_start(history),
             )
         )
     rows.sort(key=lambda r: r.excess_vs_benchmark or Decimal("-1e18"), reverse=True)
     return RelativeStrength(
         benchmark=benchmark, period=period, benchmark_return_percent=benchmark_return,
+        benchmark_window_start=_window_start(benchmark_history),
         rows=rows, notes=notes,
     )

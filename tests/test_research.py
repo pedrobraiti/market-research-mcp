@@ -131,6 +131,39 @@ async def test_relative_strength_vs_benchmark_sorted():
     assert result.rows[1].excess_vs_benchmark == Decimal("-3.00")
 
 
+async def test_relative_strength_annotates_effective_window_start():
+    # BBB has less history than the requested period (a recent IPO): its series ENDS with the
+    # others but STARTS later, so its return covers a shorter window. The effective start date
+    # per symbol (and for the benchmark) is annotated so the mismatch is visible instead of the
+    # rows silently posing as period-comparable.
+    base = date(2024, 1, 1)
+
+    class IpoAwareSource(FakeSource):
+        async def get_price_history(self, symbol, range="6mo", interval="1d", as_of=None):
+            closes = self._closes.get(symbol)
+            if closes is None:
+                return None
+            offset = 5 - len(closes)  # shorter series start later, all end on the same day
+            bars = [
+                PriceBar(date=base + timedelta(days=offset + i), close=Decimal(str(c)))
+                for i, c in enumerate(closes)
+            ]
+            return PriceHistory(symbol=symbol, interval=interval, bars=bars, as_of=as_of)
+
+    source = IpoAwareSource(
+        closes={
+            "SPY": [100, 101, 102, 103, 105],
+            "AAA": [100, 104, 108, 112, 120],
+            "BBB": [100, 102],  # 2 bars only — the "IPO"
+        }
+    )
+    result = await build_relative_strength(source, ["AAA", "BBB"], benchmark="SPY")
+    assert result.benchmark_window_start == base
+    by_symbol = {r.symbol: r for r in result.rows}
+    assert by_symbol["AAA"].window_start == base
+    assert by_symbol["BBB"].window_start == base + timedelta(days=3)  # starts later than SPY
+
+
 async def test_sector_performance_sorts_and_notes_missing():
     source = FakeSource(closes={"XLK": [100, 110], "XLE": [100, 95]})
     result = await build_sector_performance(source, period="3mo")

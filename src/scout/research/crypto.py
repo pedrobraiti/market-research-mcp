@@ -193,7 +193,9 @@ async def build_crypto_dossier(
         results = await asyncio.gather(
             quote_t,
             profile_t,
-            market.get_price_history(symbol, "1d", 300),
+            # 400 daily candles (> 365 = one 24/7 year): momentum_12m/12-1 and the true 52-week
+            # range need a full crypto year of bars — 300 left them structurally null.
+            market.get_price_history(symbol, "1d", 400),
             sentiment.get_fear_greed(14),
             derivatives.get_derivatives(base),
             onchain.get_onchain(base),

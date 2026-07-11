@@ -1,8 +1,9 @@
 """FRED implementation of ``MacroSource``.
 
 Uses FRED's keyless ``fredgraph.csv`` download endpoint, so no API key is required — it stays in
-the "free sources first" spirit. Each series is fetched concurrently; a series that fails is
-dropped from the snapshot rather than failing the whole call.
+the "free sources first" spirit. Each series is fetched concurrently; a series that fails stays
+in the snapshot with a null value and an ``unavailable: …`` status (never silently dropped —
+a missing indicator would read as "no such series").
 
 The CSV fetch is injected (``fetch_csv``) so the unit tests run fully offline.
 """
@@ -22,7 +23,7 @@ from ...analytics import (
     zscore_of_last,
 )
 from ...domain.models import MacroDerived, MacroIndicator, MacroSnapshot
-from ..retry import SourceUnavailable, with_retry
+from ..retry import SourceUnavailable, unavailable_status, with_retry
 
 _CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 
@@ -163,7 +164,7 @@ class FredMacro:
         series: dict[str, list[tuple[date, Decimal]]] = {}
         for result in results:
             if not isinstance(result, tuple):
-                continue  # a genuine fetch error → that series is dropped, as before
+                continue  # defensive: ``_one`` converts every failure into a flagged indicator
             indicator, observations = result
             indicators.append(indicator)
             if observations:
@@ -182,6 +183,7 @@ class FredMacro:
                 attempts=self._retry_attempts,
                 base_delay=self._retry_base_delay,
             )
+            observations = _observations(csv_text, as_of)
         except SourceUnavailable as exc:
             # Keep the series in the snapshot but flag it: a rate-limited/timed-out series must
             # not vanish (which would read as "no such indicator") — value is null WITH a status.
@@ -189,7 +191,13 @@ class FredMacro:
                 series_id=series_id, name=name, value=None, status=exc.status
             )
             return indicator, None
-        observations = _observations(csv_text, as_of)
+        except Exception as exc:  # noqa: BLE001 — a non-transient failure (404, parse error…)
+            # …must ALSO stay visible: null value with an ``unavailable: error`` status, exactly
+            # like the transient case, instead of the series silently vanishing from the list.
+            indicator = MacroIndicator(
+                series_id=series_id, name=name, value=None, status=unavailable_status(exc)
+            )
+            return indicator, None
         latest_date, latest_value = observations[-1] if observations else (None, None)
         indicator = MacroIndicator(
             series_id=series_id, name=name, value=latest_value, observation_date=latest_date
@@ -212,8 +220,11 @@ def _derive(series: dict[str, list[tuple[date, Decimal]]]) -> MacroDerived:
             cpi_yoy = (float(latest_value) / float(year_ago) - 1) * 100
             derived.cpi_yoy = _round(cpi_yoy, 2)
     if cpi and len(cpi) >= 4:
-        latest_date, latest_value = cpi[-1]
-        three_ago = _value_on_or_before(cpi, latest_date - timedelta(days=92))
+        # CPI is a monthly series dated on the 1st: index by POSITION — cpi[-4] is exactly
+        # 3 prints before cpi[-1]. A calendar lookup (latest − 92d) lands on the print FOUR
+        # months back in most months, and the error is then raised to the 4th power.
+        latest_value = cpi[-1][1]
+        three_ago = cpi[-4][1]
         if three_ago and three_ago != 0:
             derived.cpi_3m_annualized = _round(
                 ((float(latest_value) / float(three_ago)) ** 4 - 1) * 100, 2

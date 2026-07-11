@@ -8,10 +8,23 @@ _CHAINS = [
     {"name": "Tron", "tvl": 5000000000},
 ]
 
+# Faithful to the real /protocol/{slug} payload: ``currentChainTvls`` mixes the chain keys with
+# cross-chain aggregate buckets ("borrowed"/"staking"/"pool2") AND their per-chain twins
+# ("Ethereum-staking" repeats the same dollars as "staking"). Only the chain keys are TVL.
 _PROTOCOL = {
     "name": "Aave",
     "category": "Lending",
-    "currentChainTvls": {"Ethereum": 10000000000, "Polygon": 500000000, "Ethereum-borrowed": 99},
+    "currentChainTvls": {
+        "Ethereum": 10_000_000_000,
+        "Polygon": 500_000_000,
+        "borrowed": 10_320_000_000,
+        "Ethereum-borrowed": 9_900_000_000,
+        "Polygon-borrowed": 420_000_000,
+        "staking": 224_000_000,
+        "Ethereum-staking": 224_000_000,
+        "pool2": 1_000_000,
+        "Ethereum-pool2": 1_000_000,
+    },
 }
 
 _STABLES = {
@@ -63,8 +76,10 @@ async def test_tvl_protocol_excludes_borrowed():
 
     result = await DefiLlamaDefi(fetch_json=_fetch).get_tvl("aave")
     names = [i.name for i in result.items]
-    assert "Ethereum-borrowed" not in names
+    # Chains only — no aggregates, no suffixed buckets (summing them ~doubled the total).
+    assert names == ["Ethereum", "Polygon"]
     assert result.items[0].name == "Ethereum"
+    assert result.total_tvl_usd == Decimal("10500000000")
 
 
 async def test_stablecoins_peg_deviation():

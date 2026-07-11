@@ -6,6 +6,53 @@ dates anchor the entries.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-11
+
+### Fixed
+- **`defi_overview(slug=...)` no longer inflates protocol TVL ~2×.** DefiLlama's
+  `currentChainTvls` carries, besides the per-chain figures, the cross-chain aggregates
+  `borrowed`/`staking`/`pool2` AND their per-chain twins (`Ethereum-staking` duplicates the same
+  dollars as `staking`); the old filter only excluded the `-borrowed` suffix, so aave's TVL came out
+  ~$24.4B against the ~$13.7B headline. Protocol TVL now sums CHAIN keys only, and the test fixture
+  replicates the real payload shape (the permissive fixture is what hid this).
+- **`cpi_3m_annualized` measured a 4-month window and annualized it as a quarter.** The lookup
+  walked back `latest − 92 days` over a monthly series dated on the 1st, which lands on the print
+  from four months ago in most months, then raised to the 4th power (~+1pp systematic error at 3%
+  inflation). It now indexes the monthly series by position (`cpi[-4]`).
+- **The price fallback no longer swallows `SourceUnavailable`.** A yfinance 429 on a symbol stooq
+  cannot serve (futures like `GC=F` in `commodity_ratios`/`cointegration_test`) used to come back
+  as `None` — indistinguishable from "no such symbol", defeating the whole "unavailable ≠ no data"
+  machinery. If the primary raised `SourceUnavailable` and the fallback produced no bars, the
+  original exception now propagates.
+- **Crypto `week52_high/low` was really a ~36-week range, and `momentum_12m`/`momentum_12_1` could
+  never populate.** The 52-week window was fixed at 252 bars (the EQUITY year) and crypto tools
+  fetched only 300 daily candles (a crypto year is 365). The window now scales with
+  `periods_per_year` and `crypto_technicals`/`crypto_dossier` fetch 400 candles.
+- **`company_snapshot(as_of=...)` never returned the close of `as_of` itself** (yfinance's `end` is
+  exclusive) **and returned `price=None` in the first days of any month** (the window started on the
+  1st). The window is now ~10 calendar days ending at `as_of + 1 day`, and the fake ticker in tests
+  now reproduces yfinance's end-exclusive semantics.
+- **The Sahm gap could never go negative.** The 12-month minimum included the current month, so the
+  reported gap floored at 0 and suppressed the informative "labor market improving" negative reading
+  (the official SAHMREALTIME rule excludes the current month). Now `min(ma3[-13:-1])`; the ≥0.50
+  trigger was never affected.
+- The expiry in the options-volatility test fixture is now relative to today — the hardcoded
+  `2026-07-10` expired on 2026-07-11 and turned CI red.
+- `dividends` no longer raises on Feb 29 (`date.replace(year=...)` guard); `_cagr` annualizes over
+  the real year span instead of counting non-null values; ATR aligns closes/highs/lows per-bar
+  (the same technique the OHLC volatility block already used); a non-transient FRED series error
+  now surfaces as an indicator with an error status instead of silently vanishing from the list.
+
+### Added
+- **Price provenance.** `PriceHistory` carries a `source` field ("yfinance"/"stooq") filled by the
+  fallback wrapper; the cointegration note now names the real source per leg instead of
+  unconditionally claiming yfinance-adjusted closes (adjustment policies differ between sources —
+  a pair with legs from different sources is now flagged, honesty over silence).
+- `relative_strength` reports each symbol's effective `window_start`, so a short-history name (a
+  recent IPO) can no longer masquerade as comparable to a full-window benchmark in silence.
+- README: dynamic CI badge, real test count, the `company_snapshot` example envelope, and a note on
+  the MCP-transport smoke test.
+
 ## [0.5.4] — 2026-07-01
 
 ### Fixed

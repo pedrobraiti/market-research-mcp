@@ -70,17 +70,22 @@ async def test_as_of_picks_earlier_observation():
     assert by_id["DGS10"].observation_date == date(2026, 6, 23)
 
 
-async def test_partial_failure_drops_only_that_series():
+async def test_non_transient_failure_is_flagged_not_dropped():
+    # A genuine (non-transient) failure — a 404, a parse bug — must surface as a null value
+    # WITH an error status, exactly like the rate-limited case. A silently missing indicator
+    # reads as "no such series", which is a lie.
     async def flaky_fetch(url: str) -> str:
         if "VIXCLS" in url:
             raise RuntimeError("series fetch failed")
         return _CSV[url.split("id=")[-1]]
 
     snapshot = await FredMacro(fetch_csv=flaky_fetch).get_macro_context()
-    ids = {i.series_id for i in snapshot.indicators}
-    assert "VIXCLS" not in ids
-    assert "FEDFUNDS" in ids
-    assert len(snapshot.indicators) == 33
+    by_id = {i.series_id: i for i in snapshot.indicators}
+    assert len(snapshot.indicators) == 34  # nothing dropped
+    assert by_id["VIXCLS"].value is None
+    assert by_id["VIXCLS"].status == "unavailable: error"
+    assert by_id["FEDFUNDS"].value == Decimal("3.63")
+    assert by_id["FEDFUNDS"].status is None
 
 
 class _Resp:
@@ -191,6 +196,17 @@ async def test_derived_regime_metrics():
     assert d.real_10y_exante == Decimal("2.05")
     assert d.credit_spread_hy == Decimal("6.0")  # latest (blowout) print
     assert d.credit_spread_hy_zscore is not None and d.credit_spread_hy_zscore > 2
+
+
+async def test_cpi_3m_annualized_uses_exactly_three_monthly_prints():
+    # Monthly prints dated on the 1st: Jan=90, Feb=100, Mar/Apr/May → 103. The 3m window is
+    # Feb→May = (103/100)^4 − 1 = 12.55%. The old calendar lookup (latest − 92 days =
+    # Jan 29) landed on the JANUARY print → (103/90)^4 − 1 ≈ 71% — a 4-month window raised
+    # to the 4th power, confidently mislabelled as "3m annualized".
+    store = {"CPIAUCSL": _monthly_csv("CPIAUCSL", 2026, 1, [90, 100, 101, 102, 103])}
+    d = (await FredMacro(fetch_csv=_fetch_factory(store)).get_macro_context()).derived
+    assert d is not None
+    assert d.cpi_3m_annualized == Decimal("12.55")
 
 
 async def test_derived_is_empty_when_series_too_short():

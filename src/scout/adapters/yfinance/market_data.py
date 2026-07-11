@@ -846,12 +846,20 @@ class YFinanceMarketData:
         )
 
     def _history_closes(self, ticker: Any, as_of: date) -> tuple[Decimal | None, Decimal | None]:
-        """Return (close at/just before as_of, the close before that), best-effort."""
+        """Return (close at/just before as_of, the close before that), best-effort.
+
+        yfinance's ``end`` is EXCLUSIVE, so it must be ``as_of + 1 day`` for the ``as_of`` bar
+        itself to be included. The window reaches ~10 calendar days back — enough to always
+        contain ≥ 2 trading sessions (a first-of-the-month window had 0-1 sessions when
+        ``as_of`` fell on days 1-3, silently returning no price)."""
         history = getattr(ticker, "history", None)
         if not callable(history):
             return None, None
         try:
-            frame = history(start=str(as_of.replace(day=1)), end=str(as_of))
+            frame = history(
+                start=str(as_of - timedelta(days=_AS_OF_CLOSE_LOOKBACK_DAYS)),
+                end=str(as_of + timedelta(days=1)),
+            )
         except Exception:  # noqa: BLE001
             return None, None
         if frame is None or len(frame) == 0 or "Close" not in getattr(frame, "columns", []):
@@ -869,6 +877,10 @@ class YFinanceMarketData:
 
 # A split older than this (relative to as_of, or today) is company history, not "recent".
 _RECENT_SPLIT_WINDOW = timedelta(days=365 * 2)  # ~24 months
+
+# Calendar days of history fetched to locate the close at/just before an as_of date: long
+# enough to bridge weekends + multi-day holiday closures, short enough to stay one cheap call.
+_AS_OF_CLOSE_LOOKBACK_DAYS = 10
 
 
 def _info(ticker: Any) -> dict:
@@ -1153,15 +1165,20 @@ def _row(statement: Any, column: Any, *labels: str) -> Decimal | None:
     return None
 
 
-def _cagr(values: list[Decimal | None]) -> Decimal | None:
-    clean = [v for v in values if v is not None]
+def _cagr(points: list[tuple[date | None, Decimal | None]]) -> Decimal | None:
+    """CAGR over dated (fiscal-period-end, value) points, annualized by the REAL date span.
+    Counting intervals (``len − 1``) instead would over-annualize whenever a fiscal year is
+    missing from the statement — 2021→2024 with 2022 absent is 3 years of growth, not 2."""
+    clean = [(d, v) for d, v in points if d is not None and v is not None]
     if len(clean) < 2:
         return None
-    first, last = clean[0], clean[-1]
-    periods = len(clean) - 1
+    (first_date, first), (last_date, last) = clean[0], clean[-1]
     if first <= 0 or last <= 0:  # CAGR is undefined across non-positive endpoints
         return None
-    result = (float(last) / float(first)) ** (1.0 / periods) - 1.0
+    years = (last_date - first_date).days / 365.25
+    if years <= 0:
+        return None
+    result = (float(last) / float(first)) ** (1.0 / years) - 1.0
     return _quantize(Decimal(str(result)), 6)
 
 
@@ -1175,13 +1192,26 @@ def _statement_cagr(
     columns.sort(key=lambda c: _to_date(c) or date.min)  # oldest → newest
     if len(columns) < 2:
         return None, None, (len(columns) or None)
-    revenue = [_row(statement, c, *_REVENUE) for c in columns]
-    net_income = [_row(statement, c, *_NET_INCOME) for c in columns]
-    return _cagr(revenue), _cagr(net_income), len(columns) - 1
+    revenue = [(_to_date(c), _row(statement, c, *_REVENUE)) for c in columns]
+    net_income = [(_to_date(c), _row(statement, c, *_NET_INCOME)) for c in columns]
+    first_date, last_date = _to_date(columns[0]), _to_date(columns[-1])
+    span_years = (
+        round((last_date - first_date).days / 365.25)
+        if first_date is not None and last_date is not None
+        else None
+    )
+    return _cagr(revenue), _cagr(net_income), (span_years or None)
+
+
+def _one_year_before(reference: date) -> date:
+    try:
+        return reference.replace(year=reference.year - 1)
+    except ValueError:  # Feb 29 on a leap year — the prior year has no leap day
+        return reference.replace(year=reference.year - 1, day=28)
 
 
 def _trailing_sum(payments: list[DividendPayment], reference: date) -> Decimal | None:
-    window_start = reference.replace(year=reference.year - 1)
+    window_start = _one_year_before(reference)
     total = sum(
         (p.amount for p in payments if window_start < p.ex_date <= reference), Decimal(0)
     )

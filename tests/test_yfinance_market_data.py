@@ -5,7 +5,8 @@ import pandas as pd
 import pytest
 
 from scout.adapters.yfinance import YFinanceMarketData
-from scout.adapters.yfinance.market_data import _had_cut
+from scout.adapters.yfinance.market_data import _had_cut, _trailing_sum
+from scout.domain.models import DividendPayment
 
 _INFO = {
     "longName": "Apple Inc.",
@@ -129,7 +130,7 @@ class FakeTicker:
         )
 
     def history(self, period=None, interval=None, start=None, end=None, **kwargs):
-        return pd.DataFrame(
+        frame = pd.DataFrame(
             {
                 "Open": [220.0, 221.5],
                 "High": [222.0, 224.0],
@@ -139,6 +140,14 @@ class FakeTicker:
             },
             index=[pd.Timestamp("2024-06-10"), pd.Timestamp("2024-06-11")],
         )
+        # Faithful to the real yfinance contract: ``start`` inclusive, ``end`` EXCLUSIVE.
+        # (An earlier fake ignored start/end entirely, which hid an off-by-one for 9 sessions:
+        # code calling history(end=as_of) never gets the as_of bar from the real library.)
+        if start is not None:
+            frame = frame[frame.index >= pd.Timestamp(start)]
+        if end is not None:
+            frame = frame[frame.index < pd.Timestamp(end)]
+        return frame
 
 
 class EmptyTicker:
@@ -218,6 +227,8 @@ async def test_snapshot_parses_price_and_multiples():
 
 
 async def test_snapshot_with_as_of_uses_history_close():
+    # The fake honours yfinance's EXCLUSIVE ``end`` — so this only passes if the adapter asks
+    # for end = as_of + 1 day. The old end=as_of call could never return the as_of close.
     snapshot = await _source().get_snapshot("AAPL", as_of=date(2024, 6, 11))
     assert snapshot is not None
     assert snapshot.price == Decimal("223.5")
@@ -226,6 +237,28 @@ async def test_snapshot_with_as_of_uses_history_close():
     # Historical reads have no live freshness stamp.
     assert snapshot.quote_time is None
     assert snapshot.market_state is None
+
+
+async def test_snapshot_as_of_first_days_of_month_still_finds_price():
+    # as_of on day 1 of a month: a window opened at day 1 contains 0-1 sessions → price None.
+    # The lookback window must reach into the previous month for the last sessions before as_of.
+    class LateJuneTicker(FakeTicker):
+        def history(self, period=None, interval=None, start=None, end=None, **kwargs):
+            frame = pd.DataFrame(
+                {"Close": [500.0, 502.5]},
+                index=[pd.Timestamp("2024-06-27"), pd.Timestamp("2024-06-28")],
+            )
+            if start is not None:
+                frame = frame[frame.index >= pd.Timestamp(start)]
+            if end is not None:
+                frame = frame[frame.index < pd.Timestamp(end)]  # yfinance end is EXCLUSIVE
+            return frame
+
+    source = YFinanceMarketData(ticker_factory=LateJuneTicker)
+    snapshot = await source.get_snapshot("AAPL", as_of=date(2024, 7, 1))
+    assert snapshot is not None
+    assert snapshot.price == Decimal("502.5")  # last close at/just before as_of
+    assert snapshot.previous_close == Decimal("500.0")
 
 
 async def test_snapshot_surfaces_only_recent_splits_newest_first():
@@ -402,6 +435,18 @@ def test_had_cut_ignores_multi_year_gap():
     assert _had_cut(annual, current_year=2026) is False
 
 
+def test_trailing_sum_survives_leap_day_reference():
+    # reference = Feb 29: naive replace(year−1) raises ValueError (2027 has no Feb 29).
+    payments = [
+        DividendPayment(ex_date=date(2027, 3, 15), amount=Decimal("0.25")),
+        DividendPayment(ex_date=date(2027, 11, 15), amount=Decimal("0.25")),
+        DividendPayment(ex_date=date(2028, 2, 10), amount=Decimal("0.26")),
+    ]
+    total = _trailing_sum(payments, reference=date(2028, 2, 29))
+    # Window (2027-02-28, 2028-02-29]: all three payments fall inside.
+    assert total == Decimal("0.76")
+
+
 async def test_dividends_as_of_filters_and_recomputes():
     history = await _source().get_dividends("AAPL", as_of=date(2022, 12, 31))
     assert history is not None
@@ -500,10 +545,14 @@ async def test_options_volatility_expected_move():
             self.calls = c
             self.puts = p
 
+    # The near expiry must lie in the FUTURE relative to the test run (a hardcoded date rots:
+    # once past, days_to_expiry < 0 and expected_move silently degrades to None).
+    near_expiry = date.today() + timedelta(days=7)
+
     class OptionsTicker:
         def __init__(self, symbol):
             self.info = {"currentPrice": 250.0}
-            self.options = ["2026-07-10", "2099-08-21"]
+            self.options = [near_expiry.isoformat(), "2099-08-21"]
 
         def option_chain(self, expiry):
             if expiry == "2099-08-21":
@@ -516,7 +565,8 @@ async def test_options_volatility_expected_move():
     source = YFinanceMarketData(ticker_factory=OptionsTicker)
     vol = await source.get_options_volatility("AAPL")
     assert vol is not None
-    assert vol.expiry == date(2026, 7, 10)  # nearest expiry chosen
+    assert vol.expiry == near_expiry  # nearest expiry chosen
+    assert vol.days_to_expiry == 7
     assert vol.atm_strike == Decimal("250.0")  # closest strike to 250 price
     assert vol.atm_iv == Decimal("0.31")  # avg of ATM call 0.30 and put 0.32
     assert vol.current_price == Decimal("250.0")
@@ -692,6 +742,27 @@ async def test_quality_metrics_ratios_and_cagr():
     assert metrics.cagr_years == 1
     assert metrics.revenue_cagr is not None
     assert Decimal("0.01") < metrics.revenue_cagr < Decimal("0.03")
+
+
+async def test_cagr_uses_real_year_span_when_a_fiscal_year_is_missing():
+    # FY2021 → FY2024 with FY2022/FY2023 absent: 100 → 121 over THREE years is ~6.6%/yr.
+    # Counting intervals (len−1 = 1) would report 21%/yr — over-annualized 3×.
+    class GappyIncomeTicker(FakeTicker):
+        def __init__(self, symbol):
+            super().__init__(symbol)
+            self.income_stmt = pd.DataFrame(
+                {
+                    pd.Timestamp("2024-09-30"): {"Total Revenue": 121_000_000_000.0},
+                    pd.Timestamp("2021-09-30"): {"Total Revenue": 100_000_000_000.0},
+                }
+            )
+
+    source = YFinanceMarketData(ticker_factory=GappyIncomeTicker)
+    metrics = await source.get_quality_metrics("AAPL")
+    assert metrics is not None
+    assert metrics.cagr_years == 3  # real span between the endpoints, not column count − 1
+    assert metrics.revenue_cagr is not None
+    assert Decimal("0.06") < metrics.revenue_cagr < Decimal("0.07")
 
 
 async def test_market_movers_parses_screen():

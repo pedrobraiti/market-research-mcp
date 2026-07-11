@@ -134,6 +134,32 @@ async def test_leg_fetch_failure_sets_source_status():
     assert result.is_cointegrated is None
 
 
+async def test_note_discloses_stooq_fallback_leg():
+    # If a leg's PriceHistory was stamped "stooq" (the price path fell back), the note must
+    # NOT claim yfinance split/div-adjusted closes — provenance follows the actual source.
+    def _series(offset):
+        return [100.0 + offset + (i % 7) for i in range(60)]
+
+    async def _fetch(symbol):
+        history = _history(symbol, _series(0 if symbol == "A" else 50))
+        history.source = "stooq" if symbol == "B" else "yfinance"
+        return history
+
+    result = await CointegrationAnalyzer(_fetch).get_cointegration("A", "B")
+    assert result.note is not None
+    assert "stooq" in result.note
+    assert "Uses yfinance split/div-adjusted closes" not in result.note
+
+
+async def test_note_keeps_yfinance_claim_when_no_leg_fell_back():
+    closes = {
+        "A": [float(i % 7) + 100 for i in range(60)],
+        "B": [float(i % 5) + 50 for i in range(60)],
+    }
+    result = await _analyzer(closes).get_cointegration("A", "B")
+    assert result.note is not None and "yfinance split/div-adjusted closes" in result.note
+
+
 async def test_crit_values_always_present():
     result = await _analyzer({"A": [1, 2], "B": [1, 2]}).get_cointegration("A", "B")
     assert result.adf_crit_5pct == Decimal("-3.34")

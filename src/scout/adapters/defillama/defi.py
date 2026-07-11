@@ -41,6 +41,18 @@ _PROTOCOL_FEES_URL = "https://api.llama.fi/summary/fees/{slug}?dataType=dailyFee
 _PROTOCOL_REVENUE_URL = "https://api.llama.fi/summary/fees/{slug}?dataType=dailyRevenue"
 _TOP_PROTOCOLS = 15
 
+# ``currentChainTvls`` mixes per-chain TVL ("Ethereum", "Polygon"…) with NON-chain buckets:
+# the cross-chain aggregates "borrowed"/"staking"/"pool2" AND their per-chain twins
+# ("Ethereum-staking" duplicates the same dollars as "staking"). Summing any of them
+# double-counts (borrowed alone inflated aave ~2×) — protocol TVL is the CHAIN keys only.
+_NON_CHAIN_TVL_KEYS = {"borrowed", "staking", "pool2"}
+_NON_CHAIN_TVL_SUFFIXES = ("-borrowed", "-staking", "-pool2")
+
+
+def _is_chain_tvl(key: Any) -> bool:
+    name = str(key)
+    return name not in _NON_CHAIN_TVL_KEYS and not name.endswith(_NON_CHAIN_TVL_SUFFIXES)
+
 
 def _dec(value: Any) -> Decimal | None:
     if value is None:
@@ -79,7 +91,7 @@ class DefiLlamaDefi:
             items = [
                 DefiTvlItem(name=chain, tvl_usd=_dec(tvl))
                 for chain, tvl in chain_tvls.items()
-                if not str(chain).endswith("-borrowed")
+                if _is_chain_tvl(chain)
             ]
             items.sort(key=lambda i: i.tvl_usd or Decimal(0), reverse=True)
             total = sum((i.tvl_usd or Decimal(0)) for i in items) or None

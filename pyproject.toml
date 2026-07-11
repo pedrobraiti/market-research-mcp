@@ -1,6 +1,6 @@
 [project]
 name = "market-research-mcp"
-version = "0.5.4"
+version = "0.6.0"
 description = "Scout — an MCP server that gathers and structures financial data for AI trading agents (snapshots, fundamentals, dividends, and more). Stateless; pairs with agentic-trading-mcp."
 readme = "README.md"
 requires-python = ">=3.12"
