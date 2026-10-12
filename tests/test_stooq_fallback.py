@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from scout.adapters.price_fallback import PriceFallbackMarketData
+from scout.adapters.price_fallback import PriceFallbackMarketData, PriceHistoryUnavailable
 from scout.adapters.retry import SourceUnavailable
 from scout.adapters.stooq import StooqPrices
 from scout.domain.models import PriceBar, PriceHistory
@@ -133,3 +133,119 @@ async def test_genuinely_empty_primary_with_empty_fallback_stays_none():
 async def test_fallback_delegates_other_methods_to_primary():
     wrapped = PriceFallbackMarketData(_Primary(), _Fallback())
     assert wrapped.fallback_marker == "primary"  # __getattr__ delegation
+
+
+# --- Real stooq payloads (audit 2026-10-10, evidencia-1-stooq.json) --------------------------
+# stooq answered HTTP 200 "text/html; charset=utf-8" with this JavaScript proof-of-work challenge
+# instead of CSV, even with the adapter's own User-Agent. The first 700 chars are verbatim from
+# the evidence; only the truncated tail is closed so the body is a complete HTML document.
+_STOOQ_CHALLENGE_HTML = (
+    '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="robots" '
+    'content="noindex,nofollow"></head><body><noscript>This site requires JavaScript to verify '
+    "your browser. Please enable JavaScript and reload.</noscript><script "
+    'nonce="8h39ivcUmW5hdqy6T_wzgw">\n(async()=>{const c="AAAAAGrKhx1hkgByJHmN60yNEcmvd5n5vQQYOUL'
+    'FWeo2bJOJVGwa3lMhRK0",d=4,t="0".repeat(d),e=new TextEncoder;let n=0;while(1){const h=await '
+    'crypto.subtle.digest("SHA-256",e.encode(c+n)),x=Array.from(new Uint8Array(h)).map(b=>b.toSt'
+    'ring(16).padStart(2,"0")).join("");if(x.startsWith(t))break;n++}const r=await fetch("/__veri'
+    'fy",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"c="+en'
+    'codeURIComponent(c)+"&n="+n});if(r.ok)location.reload()})();</script></body></html>'
+)
+
+
+def _stooq_over_http(status: int, body: str, content_type: str) -> StooqPrices:
+    """StooqPrices driven through its REAL httpx fetch path via a mock transport."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "stooq.com"
+        return httpx.Response(
+            status, headers={"content-type": content_type}, content=body.encode("utf-8")
+        )
+
+    return StooqPrices(transport=httpx.MockTransport(handler))
+
+
+def _stooq_text(body: str) -> StooqPrices:
+    async def _fetch(url: str) -> str:
+        return body
+
+    return StooqPrices(fetch_csv=_fetch)
+
+
+async def test_stooq_js_challenge_over_http_200_is_blocked_not_none():
+    stooq = _stooq_over_http(200, _STOOQ_CHALLENGE_HTML, "text/html; charset=utf-8")
+    with pytest.raises(SourceUnavailable) as exc_info:
+        await stooq.get_price_history("SPY", range="1mo", interval="1d")
+    assert exc_info.value.reason == "blocked"
+    assert exc_info.value.status == "unavailable: blocked"
+    assert "JavaScript bot challenge" in str(exc_info.value)
+
+
+async def test_stooq_csv_over_http_still_parses():
+    # The real path must keep working when stooq does serve CSV.
+    stooq = _stooq_over_http(200, _CSV, "text/csv")
+    history = await stooq.get_price_history("aapl", range="1mo", as_of=date(2024, 6, 11))
+    assert history is not None and len(history.bars) == 2
+
+
+async def test_stooq_no_data_body_is_genuine_absence():
+    # stooq's own answer for an unknown symbol: an honest None ("no data"), not a failure.
+    assert await _stooq_text("No data").get_price_history("ZZZZ") is None
+
+
+async def test_stooq_changed_csv_header_is_schema_error():
+    with pytest.raises(SourceUnavailable) as exc_info:
+        await _stooq_text("Data;Otwarcie;Max\n2024-06-11;1;2\n").get_price_history("AAPL")
+    assert exc_info.value.reason == "schema_error"
+
+
+async def test_stooq_empty_body_is_schema_error():
+    with pytest.raises(SourceUnavailable) as exc_info:
+        await _stooq_text("   \n").get_price_history("AAPL")
+    assert exc_info.value.reason == "schema_error"
+
+
+async def test_stooq_daily_hits_limit_is_rate_limited():
+    with pytest.raises(SourceUnavailable) as exc_info:
+        await _stooq_text("Exceeded the daily hits limit").get_price_history("AAPL")
+    assert exc_info.value.reason == "rate_limited"
+
+
+class _SchemaChangedPrimary:
+    async def get_price_history(self, symbol, range="6mo", interval="1d", as_of=None):
+        raise ValueError("schema changed")
+
+
+async def test_generic_primary_error_with_empty_fallback_raises_not_none():
+    # The audit's offline repro: primary ValueError + empty fallback used to return None (and
+    # so an ok:true envelope with null data). Now it raises with the primary's cause first.
+    wrapped = PriceFallbackMarketData(_SchemaChangedPrimary(), _Fallback(result=None))
+    with pytest.raises(PriceHistoryUnavailable) as exc_info:
+        await wrapped.get_price_history("AAPL")
+    error = exc_info.value
+    assert isinstance(error, SourceUnavailable)  # same ADR-012 family every caller handles
+    assert error.reason == "error"
+    assert isinstance(error.primary_error, ValueError)
+    assert error.fallback_error is None
+    assert "yfinance failed (unavailable: error — ValueError: schema changed)" in str(error)
+    assert "stooq fallback returned no bars" in str(error)
+
+
+async def test_primary_error_with_blocked_stooq_preserves_both_causes():
+    stooq = _stooq_over_http(200, _STOOQ_CHALLENGE_HTML, "text/html; charset=utf-8")
+    wrapped = PriceFallbackMarketData(_SchemaChangedPrimary(), stooq)
+    with pytest.raises(PriceHistoryUnavailable) as exc_info:
+        await wrapped.get_price_history("SPY")
+    error = exc_info.value
+    assert error.reason == "error"  # the PRIMARY's reason leads
+    assert error.fallback_error.reason == "blocked"
+    message = str(error)
+    assert message.index("schema changed") < message.index("unavailable: blocked")
+
+
+async def test_rate_limited_primary_keeps_its_reason_through_the_wrapper():
+    wrapped = PriceFallbackMarketData(_Primary(raises_unavailable=True), _Fallback(raises=True))
+    with pytest.raises(SourceUnavailable) as exc_info:
+        await wrapped.get_price_history("AAPL")
+    assert exc_info.value.reason == "rate_limited"
+    assert "stooq fallback failed" in str(exc_info.value)

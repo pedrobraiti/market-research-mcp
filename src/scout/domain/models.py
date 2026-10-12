@@ -381,6 +381,16 @@ class MacroIndicator(BaseModel):
             "'unavailable: timeout') — distinct from a genuine null value. None means fetched OK."
         ),
     )
+    frequency: str | None = None  # daily / weekly / monthly / quarterly (FRED observation cadence)
+    age_days: int | None = Field(
+        default=None,
+        description="Days between observation_date and the reference date (as_of, else today).",
+    )
+    stale: bool | None = Field(
+        default=None,
+        description="True when age_days exceeds this series' staleness limit (set per frequency "
+        "and publication lag) — the latest print is older than a current read should be.",
+    )
 
 
 class MacroDerived(BaseModel):
@@ -417,6 +427,17 @@ class MacroDerived(BaseModel):
     m2_yoy: Decimal | None = None  # M2 money stock YoY growth, %
     dollar_broad_zscore: Decimal | None = None  # broad nominal USD index vs its ~1y window
     brent_wti_spread: Decimal | None = None  # Brent − WTI crude, $/bbl (global-vs-US crude stress)
+    inputs_as_of: dict[str, dict[str, date]] = Field(
+        default_factory=dict,
+        description="Per derived field, the observation date of each FRED series it was built "
+        "from (e.g. real_10y → {DGS10: …, CPIAUCSL: …}) — a composite's inputs can differ in age.",
+    )
+    stale_inputs: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Per derived field, the input series whose observation was stale (past its "
+        "staleness limit) — the figure is still given, but it silently mixes an old print "
+        "otherwise. Empty means every input was current.",
+    )
     notes: list[str] = []
 
 
@@ -440,6 +461,12 @@ class SecFinancialLine(BaseModel):
     fiscal_year: int | None = None
     form: str | None = None
     filed: date | None = None
+    status: str | None = Field(
+        default=None,
+        description="None when a value was found. 'not_reported' = the filer reports no annual "
+        "10-K value under these tags (a genuine absence); 'unavailable: <reason> — …' = SEC could "
+        "not be read (403/429/timeout…), so a null here says nothing about the company.",
+    )
 
 
 class SecFinancials(BaseModel):
@@ -455,6 +482,12 @@ class SecFinancials(BaseModel):
     period_end: date | None = None
     lines: list[SecFinancialLine] = []
     as_of: date | None = None
+    status: str | None = Field(
+        default=None,
+        description="None when every line was read. 'unavailable: <reason>' when NO line could "
+        "be read from SEC (the nulls are a fetch failure, not missing financials); 'partial: "
+        "<concepts> unavailable' when only some could.",
+    )
 
 
 class NewsItem(BaseModel):
@@ -1057,8 +1090,22 @@ class DefiFees(BaseModel):
 class DerivativesVenue(BaseModel):
     exchange: str
     symbol: str | None = None
-    funding_rate: Decimal | None = None
-    funding_rate_annualized: Decimal | None = None  # funding × 3/day × 365 (assumes 8h interval)
+    funding_rate: Decimal | None = None  # the venue's raw rate, per ITS OWN funding interval
+    # funding × (24 / funding_interval_hours) × 365 — null when the interval is unknown.
+    funding_rate_annualized: Decimal | None = None
+    funding_interval_hours: Decimal | None = Field(
+        default=None,
+        description="This symbol's real funding interval on this venue (1h/4h/8h…), read from "
+        "the venue — null when it could not be determined (then no normalized figure is given).",
+    )
+    funding_interval_source: str | None = Field(
+        default=None,
+        description="Where the interval came from: 'venue' (a per-symbol field), 'venue_default' "
+        "(Binance: symbol absent from fundingInfo → its documented 8h default), 'schedule' (OKX: "
+        "nextFundingTime − fundingTime), or 'unknown — <reason>'.",
+    )
+    # funding_rate × 8 / funding_interval_hours — the comparable 8h-equivalent across venues.
+    funding_rate_8h: Decimal | None = None
     next_funding_time: datetime | None = None
     mark_price: Decimal | None = None
     open_interest: Decimal | None = None
@@ -1075,14 +1122,26 @@ class CryptoDerivatives(BaseModel):
     base: str
     venues: list[DerivativesVenue] = []
     # Cross-venue positioning, derived from the venues above (raw measures, not a verdict):
-    funding_oi_weighted: Decimal | None = None  # Σ(funding × OI_usd) / Σ(OI_usd) — real consensus
-    funding_annualized_oi_weighted: Decimal | None = None  # the same, annualized (8h assumption)
-    funding_dispersion: Decimal | None = None  # max − min funding across venues (stress/arb signal)
+    # Σ(funding_rate_8h × OI_usd) / Σ(OI_usd) — consensus on the 8h-EQUIVALENT rate, so a 1h and
+    # an 8h venue are compared like for like (venues whose interval is unknown are left out).
+    funding_oi_weighted: Decimal | None = None
+    funding_annualized_oi_weighted: Decimal | None = None  # the same × 3 × 365
+    funding_dispersion: Decimal | None = None  # max − min 8h-equivalent funding across venues
     total_open_interest_value: Decimal | None = None  # Σ OI in USD across venues
     partial: bool = Field(
         default=False,
         description="True when at least one venue was dropped — the cross-venue aggregates are "
-        "computed over fewer exchanges than attempted, so read them as a thinner picture.",
+        "computed over fewer exchanges than attempted, so read them as a thinner picture. "
+        "`unavailable_venues` names them and `venue_status` gives each one's reason.",
+    )
+    venue_status: dict[str, str] = Field(
+        default_factory=dict,
+        description="Per attempted venue: 'ok', or 'unavailable: <reason> — <detail>' (a fetch "
+        "error, or an error/empty payload from the venue — never turned into a row of nulls).",
+    )
+    unavailable_venues: list[str] = Field(
+        default_factory=list,
+        description="The venues that returned no usable data (see `venue_status` for why).",
     )
     note: str | None = None
 

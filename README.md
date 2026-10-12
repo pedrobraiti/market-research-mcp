@@ -110,7 +110,8 @@ across the tools below, then composes the result itself.
 
 **No API keys or logins required.** The only optional setting is `SCOUT_SEC_USER_AGENT` (SEC policy:
 an identifiable User-Agent) — without it the SEC tools (`filings`, `sec_financials`, `filing_search`)
-return a clear "please set it" message; everything else works keyless.
+return `unavailable: misconfigured — SCOUT_SEC_USER_AGENT not set…` and send no request at all;
+everything else works keyless.
 
 ## Tools (62)
 
@@ -147,7 +148,7 @@ return a clear "please set it" message; everything else works keyless.
 - `wikipedia_attention(article, days?)` — daily Wikipedia pageviews — an attention proxy.
 
 **Macro**
-- `macro_context(as_of?)` — key US macro (**FRED**) + a rich `derived` block: rates/curve/CPI/VIX, plus **Fed net liquidity** (WALCL−TGA−RRP), financial-conditions (NFCI/STLFSI4), jobless claims, growth nowcasts (GDPNow/CFNAI), VIX term structure, 5y5y forward, M2 YoY, SOFR, broad dollar, Brent-WTI, Sahm gap & recession probit.
+- `macro_context(as_of?)` — key US macro (**FRED**) + a rich `derived` block: rates/curve/CPI/VIX, plus **Fed net liquidity** (WALCL−TGA−RRP), financial-conditions (NFCI/STLFSI4), jobless claims, growth nowcasts (GDPNow/CFNAI), VIX term structure, 5y5y forward, M2 YoY, SOFR, broad dollar, Brent-WTI, Sahm gap & recession probit. Each input's observation date and a `stale` flag are exposed (`inputs_as_of` / `stale_inputs`), so a composite never silently mixes an old print.
 - `cot_positioning(market, weeks?)` — CFTC **Commitments of Traders**: speculator vs commercial net positioning, % of OI, week-over-week change, crowding z-score.
 - `commodity_ratios()` — macro bellwethers **copper/gold** (Dr. Copper, risk appetite) and **gold/silver**, with z-scores (yfinance).
 - `world_macro(country?, codes?)` — country-level macro (**World Bank**): GDP, inflation, unemployment…
@@ -177,7 +178,7 @@ return a clear "please set it" message; everything else works keyless.
 - `crypto_dossier(symbol, depth?)` — **flagship:** quote + profile + technicals + Fear & Greed + derivatives + on-chain, **in parallel**.
 - `crypto_asset_profile(symbol)` — supply (circ/total/max), market cap, rank, ATH (**Coinpaprika**).
 - `crypto_onchain(asset?)` — network health: BTC fees/hashrate (**mempool.space**), ETH gas/addresses (**Blockscout**).
-- `crypto_derivatives(symbol)` — perp funding rate & open interest across **Binance/Bybit/OKX** (positioning context).
+- `crypto_derivatives(symbol)` — perp funding rate & open interest across **Binance/Bybit/OKX** (positioning context); each venue's real funding interval (1h/4h/8h) is read from the venue and rates are normalized to an 8h-equivalent before aggregating; failed venues are named in `venue_status`.
 - `crypto_implied_vol(asset?)` — the **Deribit** DVOL index ("crypto VIX") for BTC/ETH + history.
 - `coinbase_premium(symbol?, days?)` — US-spot (Coinbase) vs offshore (Binance) premium — institutional/US demand tell (CCXT).
 - `btc_network()` — BTC base-layer: hash rate, miner revenue, **NVT** (real, on-chain settlement) + live fee market & difficulty (**Blockchain.com** + **mempool.space**).

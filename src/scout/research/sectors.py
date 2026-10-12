@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from ..domain.models import SectorPerformance, SectorReturn
 from ..domain.ports import MarketDataSource
+from .notes import unavailable_or_not_found
 from .relative_strength import _total_return_pct
 
 # Sector → SPDR ETF (the standard 11 GICS sectors).
@@ -41,7 +42,7 @@ async def build_sector_performance(
     notes: list[str] = []
     for (sector, etf), history in zip(_SECTOR_ETFS, histories, strict=False):
         if isinstance(history, Exception) or history is None:
-            notes.append(f"{sector} ({etf}): unavailable")
+            notes.append(f"{sector} ({etf}): {unavailable_or_not_found(history)}")
             continue
         sectors.append(
             SectorReturn(sector=sector, etf=etf, return_percent=_total_return_pct(history))

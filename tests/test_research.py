@@ -244,3 +244,43 @@ async def test_calendar_drops_past_events():
     )
     result = await build_calendar(source, ["AAPL"], as_of=date(2026, 6, 25))
     assert result.events == []
+
+
+class _BlockedHistorySource(FakeSource):
+    """Price history for listed symbols raises the fallback's 'blocked' unavailability."""
+
+    def __init__(self, blocked, **kwargs):
+        super().__init__(**kwargs)
+        self._blocked = set(blocked)
+
+    async def get_price_history(self, symbol, range="6mo", interval="1d", as_of=None):
+        if symbol in self._blocked:
+            from scout.adapters.retry import BLOCKED, SourceUnavailable
+
+            raise SourceUnavailable(BLOCKED, "stooq returned a JavaScript bot challenge")
+        return await super().get_price_history(symbol, range, interval, as_of)
+
+
+async def test_correlation_notes_tag_unavailable_vs_not_found():
+    source = _BlockedHistorySource(
+        blocked={"BBB"}, closes={"AAA": [1, 2, 3, 4], "CCC": [2, 3, 4, 5]}
+    )
+    result = await build_correlation(source, ["AAA", "BBB", "CCC", "ZZZ"])
+    assert "BBB: price history unavailable: blocked" in result.notes  # couldn't fetch
+    assert "ZZZ: price history not_found" in result.notes  # genuinely no data
+
+
+async def test_sector_performance_notes_tag_the_reason():
+    source = _BlockedHistorySource(blocked={"XLK"}, closes={"XLE": [100, 95]})
+    result = await build_sector_performance(source, period="3mo")
+    assert "Technology (XLK): unavailable: blocked" in result.notes
+    assert "Health Care (XLV): not_found" in result.notes
+
+
+async def test_relative_strength_rows_and_benchmark_tag_the_reason():
+    source = _BlockedHistorySource(blocked={"SPY", "BBB"}, closes={"AAA": [100, 110]})
+    result = await build_relative_strength(source, ["AAA", "BBB", "ZZZ"], benchmark="SPY")
+    assert any("SPY price history unavailable: blocked" in n for n in result.notes)
+    by_symbol = {r.symbol: r for r in result.rows}
+    assert by_symbol["BBB"].note == "price history unavailable: blocked"
+    assert by_symbol["ZZZ"].note == "price history not_found"

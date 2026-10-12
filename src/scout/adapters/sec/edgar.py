@@ -2,6 +2,10 @@
 
 EDGAR is free and authoritative — the primary source filings cross-check yfinance against.
 It requires an identifiable ``User-Agent`` (SEC policy) and is rate-limited to ~10 req/s.
+With no User-Agent configured the adapter sends NOTHING: every call fails fast as
+``unavailable: misconfigured`` (SEC answers an undeclared agent with a 403 HTML page, which used to
+surface as six null financial lines). Each XBRL line carries a status, so a fetch failure is never
+confused with a concept the company simply does not report.
 
 The HTTP layer is injected via ``fetch_json`` (a callable ``url -> dict``), imported lazily
 only when the default httpx-based fetcher is used, so the unit tests run fully offline.
@@ -25,6 +29,39 @@ from ...domain.models import (
     SecFinancialLine,
     SecFinancials,
 )
+from ..retry import BLOCKED, SourceUnavailable, unavailable_status
+
+USER_AGENT_ENV_VAR = "SCOUT_SEC_USER_AGENT"
+MISCONFIGURED = "misconfigured"
+NOT_REPORTED = "not_reported"
+_HTTP_NOT_FOUND = 404
+_HTTP_FORBIDDEN = 403
+
+
+def missing_user_agent_error() -> SourceUnavailable:
+    """The explicit failure for an unset SEC identity — never an anonymous request."""
+    return SourceUnavailable(
+        MISCONFIGURED,
+        f"{USER_AGENT_ENV_VAR} not set. SEC EDGAR requires an identifiable User-Agent "
+        "(e.g. 'Your Name you@email.com'); no request was sent.",
+    )
+
+
+def _http_status(exc: Exception) -> int | None:
+    return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _failure_status(exc: BaseException) -> str:
+    if not isinstance(exc, Exception):
+        return "unavailable: error"
+    if isinstance(exc, SourceUnavailable):
+        return str(exc)
+    if _http_status(exc) == _HTTP_FORBIDDEN:
+        return (
+            f"unavailable: {BLOCKED} — SEC answered 403 (undeclared or rejected User-Agent? "
+            f"check {USER_AGENT_ENV_VAR})"
+        )
+    return f"{unavailable_status(exc)} — {type(exc).__name__}: {str(exc).splitlines()[0][:120]}"
 
 _FTS_URL = "https://efts.sec.gov/LATEST/search-index?q={query}"
 _TICKER_RE = re.compile(r"\(([A-Z][A-Z.\-]{0,6})[,)]")
@@ -111,7 +148,13 @@ class SecEdgar:
         self._cik_by_ticker: dict[str, str] | None = None
         self._lock = asyncio.Lock()
 
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._user_agent and self._user_agent.strip())
+
     async def _default_fetch_json(self, url: str) -> dict:
+        if not self.is_configured:
+            raise missing_user_agent_error()
         import httpx  # imported lazily so offline tests never need httpx or the network
 
         headers = {"User-Agent": self._user_agent, "Accept-Encoding": "gzip, deflate"}
@@ -238,7 +281,12 @@ class SecEdgar:
             *(self._concept_line(cik, concept, tags, as_of) for concept, tags in _CONCEPTS),
             return_exceptions=True,
         )
-        lines = [line for line in results if isinstance(line, SecFinancialLine)]
+        lines = [
+            result
+            if isinstance(result, SecFinancialLine)
+            else SecFinancialLine(concept=concept, status=_failure_status(result))
+            for (concept, _), result in zip(_CONCEPTS, results, strict=True)
+        ]
         # Anchor the snapshot's fiscal year on a core line (net income, else the first with data).
         anchor = next(
             (line for line in lines if line.concept == "net_income" and line.value is not None),
@@ -251,15 +299,21 @@ class SecEdgar:
             period_end=anchor.period_end if anchor else None,
             lines=lines,
             as_of=as_of,
+            status=_financials_status(lines),
         )
 
     async def _concept_line(
         self, cik: str, concept: str, tags: tuple[str, ...], as_of: date | None
     ) -> SecFinancialLine:
+        failure: Exception | None = None
         for tag in tags:
             try:
                 data = await self._fetch_json(_CONCEPT_URL.format(cik=cik, tag=tag))
-            except Exception:  # noqa: BLE001 — a 404 just means this filer doesn't use the tag
+            except Exception as exc:  # noqa: BLE001
+                # A 404 means this filer doesn't use the tag (try the next one); anything else
+                # (403, 429, timeout…) is a failure to READ, kept so the line says so.
+                if _http_status(exc) != _HTTP_NOT_FOUND:
+                    failure = exc
                 continue
             observations = ((data or {}).get("units") or {}).get("USD") or []
             entry = _pick_annual(observations, as_of)
@@ -275,4 +329,16 @@ class SecEdgar:
                 form=entry.get("form"),
                 filed=_parse_date(entry.get("filed")),
             )
-        return SecFinancialLine(concept=concept, value=None)
+        status = _failure_status(failure) if failure is not None else NOT_REPORTED
+        return SecFinancialLine(concept=concept, value=None, status=status)
+
+
+def _financials_status(lines: list[SecFinancialLine]) -> str | None:
+    unavailable = [
+        line for line in lines if line.status and line.status.startswith("unavailable")
+    ]
+    if not unavailable:
+        return None
+    if all(line.value is None for line in lines) and len(unavailable) == len(lines):
+        return unavailable[0].status
+    return f"partial: {', '.join(line.concept for line in unavailable)} unavailable"

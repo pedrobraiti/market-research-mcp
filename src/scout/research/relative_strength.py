@@ -13,6 +13,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from ..domain.models import RelativeStrength, RelativeStrengthRow
 from ..domain.ports import MarketDataSource
+from .notes import unavailable_or_not_found
 
 
 def _total_return_pct(history) -> Decimal | None:
@@ -56,11 +57,20 @@ async def build_relative_strength(
 
     rows: list[RelativeStrengthRow] = []
     notes: list[str] = []
-    if benchmark_return is None:
+    if isinstance(histories[0], Exception):
+        notes.append(
+            f"Benchmark {benchmark} price history {unavailable_or_not_found(histories[0])} — "
+            "excess can't be computed."
+        )
+    elif benchmark_return is None:
         notes.append(f"Benchmark {benchmark} return unavailable — excess can't be computed.")
     for symbol, history in zip(clean, histories[1:], strict=False):
         if isinstance(history, Exception) or history is None:
-            rows.append(RelativeStrengthRow(symbol=symbol, note="price history unavailable"))
+            rows.append(
+                RelativeStrengthRow(
+                    symbol=symbol, note=f"price history {unavailable_or_not_found(history)}"
+                )
+            )
             continue
         symbol_return = _total_return_pct(history)
         excess = (

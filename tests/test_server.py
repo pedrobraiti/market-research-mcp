@@ -205,6 +205,7 @@ async def test_sec_financials_requires_user_agent(use_source):
     result = await app_module.sec_financials("AAPL")
     assert result["ok"] is False
     assert "SCOUT_SEC_USER_AGENT" in result["error"]
+    assert result["error"].startswith("unavailable: misconfigured")
 
 
 async def test_sec_financials_returns_data_when_configured(use_source):
@@ -261,3 +262,64 @@ def test_warm_up_ccxt_swallows_errors(monkeypatch):
 
     monkeypatch.setattr(ccxt, "binance", boom)
     app._warm_up_ccxt()  # must return, not raise
+
+
+# --- Source failures must reach the envelope, never as ok:true + null (audit 2026-10-10) -----
+
+
+class _SchemaChangedSource(FakeSource):
+    async def get_price_history(self, symbol, range="6mo", interval="1d", as_of=None):
+        raise ValueError("schema changed")
+
+
+class _BlockedStooq:
+    async def get_price_history(self, symbol, range="6mo", interval="1d", as_of=None):
+        from scout.adapters.retry import BLOCKED, SourceUnavailable
+
+        raise SourceUnavailable(BLOCKED, "stooq returned a JavaScript bot challenge instead of CSV")
+
+
+async def test_price_history_tool_surfaces_both_source_failures(use_source):
+    from scout.adapters.price_fallback import PriceFallbackMarketData
+
+    use_source(PriceFallbackMarketData(_SchemaChangedSource(), _BlockedStooq()))
+    result = await app_module.price_history("spy")
+    assert result["ok"] is False  # never ok:true with data:null
+    assert result["error"].startswith("unavailable: error")
+    assert "yfinance failed" in result["error"] and "schema changed" in result["error"]
+    assert "stooq fallback failed (unavailable: blocked" in result["error"]
+
+
+async def test_technicals_tool_surfaces_source_failure(use_source):
+    from scout.adapters.price_fallback import PriceFallbackMarketData
+
+    use_source(PriceFallbackMarketData(_SchemaChangedSource(), _BlockedStooq()))
+    result = await app_module.technicals("spy")
+    assert result["ok"] is False
+    assert "unavailable: blocked" in result["error"]
+
+
+async def test_news_search_tool_reports_gdelt_429_as_source_status():
+    import httpx
+
+    from scout.adapters.gdelt import GdeltNewsSearch
+
+    def handler(request):
+        return httpx.Response(429, content=b"Please limit requests to one every 5 seconds")
+
+    async def no_sleep(seconds):
+        return None
+
+    previous = app_module._services
+    app_module._services = Services(
+        settings=get_settings(),
+        market_data=FakeSource(),
+        news_search=GdeltNewsSearch(transport=httpx.MockTransport(handler), sleep=no_sleep),
+    )
+    try:
+        result = await app_module.news_search("bitcoin")
+    finally:
+        app_module._services = previous
+    assert result["ok"] is True
+    assert result["data"]["items"] == []
+    assert result["data"]["source_status"] == "unavailable: rate_limited"

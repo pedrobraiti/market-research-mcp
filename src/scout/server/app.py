@@ -14,6 +14,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from ..adapters.sec import missing_user_agent_error
 from ..analytics import compute_technicals
 from ..domain.models import CryptoPriceHistory, Period, PriceBar, PriceHistory
 from ..research import (
@@ -324,7 +325,10 @@ async def price_history(
 
     `period` is a yfinance range (e.g. "1mo", "3mo", "6mo", "1y", "2y", "5y", "max");
     `interval` is the bar size (e.g. "1d", "1wk", "1h", "5m"). Pass `as_of` (YYYY-MM-DD) to
-    truncate at a past date. Returns a list of bars (date + open/high/low/close/volume).
+    truncate at a past date. Returns a list of bars (date + open/high/low/close/volume); `source`
+    names the upstream that served them (yfinance, or the stooq fallback). If the primary FAILED
+    and the fallback can't deliver either, this is `ok: false` with an `unavailable: <reason>`
+    error naming each source's cause — `data: null` only ever means "no bars for this symbol".
     """
     svc = services()
     try:
@@ -375,12 +379,7 @@ async def filings(
     """
     svc = services()
     if svc.filings is None or not svc.settings.sec_user_agent.strip():
-        return _err(
-            ValueError(
-                "Set SCOUT_SEC_USER_AGENT (e.g. 'Your Name you@email.com') — SEC EDGAR "
-                "requires an identifiable User-Agent."
-            )
-        )
+        return _err(missing_user_agent_error())
     try:
         result = await svc.filings.get_filings(symbol, form_type, int(limit), _parse_as_of(as_of))
         return _ok(result.model_dump(mode="json") if result else None)
@@ -626,7 +625,11 @@ async def macro_context(as_of: str | None = None) -> dict:
     long), a 12-month recession probability (NY-Fed term-spread probit), and the high-yield credit
     spread with its z-score (a financial-stress gauge that often widens before equities fall). A
     bare CPI index level says nothing alone — the derived block is what's usable. Pass `as_of`
-    (YYYY-MM-DD) for a point-in-time read. Numbers and explicit measures, not a regime verdict.
+    (YYYY-MM-DD) for a point-in-time read (filtered by observation date, not publication date).
+    Temporal honesty: each indicator carries `frequency`, `age_days` and `stale` (past a
+    per-frequency limit); `derived.inputs_as_of` gives the observation date of every input behind
+    each derived figure and `derived.stale_inputs` names any stale one — the figure is still
+    given, never silently built on an old print. Numbers and explicit measures, not a verdict.
     """
     svc = services()
     if svc.macro is None:
@@ -692,12 +695,7 @@ async def filing_search(query: str, forms: str | None = None, limit: int = 10) -
     """
     svc = services()
     if svc.filings is None or not svc.settings.sec_user_agent.strip():
-        return _err(
-            ValueError(
-                "Set SCOUT_SEC_USER_AGENT (e.g. 'Your Name you@email.com') — SEC EDGAR "
-                "requires an identifiable User-Agent."
-            )
-        )
+        return _err(missing_user_agent_error())
     try:
         result = await svc.filings.search_filings(query, forms, int(limit))
         return _ok(result.model_dump(mode="json"))
@@ -713,16 +711,14 @@ async def sec_financials(symbol: str, as_of: str | None = None) -> dict:
     stockholders' equity for the latest fiscal year (10-K) at or before `as_of` (YYYY-MM-DD) —
     each line tagged with the exact us-gaap concept, period end, form and filing date. Use it to
     **cross-check** `fundamentals` (which comes from yfinance) against the primary source. `data`
-    is null if the symbol can't be resolved. Requires SCOUT_SEC_USER_AGENT (SEC policy).
+    is null if the symbol can't be resolved. Each line's `status` separates `not_reported` (the
+    filer has no such 10-K value) from `unavailable: …` (SEC couldn't be read); the top-level
+    `status` says when some or all lines are unreadable. Requires SCOUT_SEC_USER_AGENT (SEC
+    policy) — unset, the tool returns `unavailable: misconfigured` and sends no request.
     """
     svc = services()
     if svc.financials is None or not svc.settings.sec_user_agent.strip():
-        return _err(
-            ValueError(
-                "Set SCOUT_SEC_USER_AGENT (e.g. 'Your Name you@email.com') — SEC EDGAR "
-                "requires an identifiable User-Agent."
-            )
-        )
+        return _err(missing_user_agent_error())
     try:
         result = await svc.financials.get_financials(symbol, _parse_as_of(as_of))
         return _ok(result.model_dump(mode="json") if result else None)
@@ -1036,8 +1032,11 @@ async def crypto_derivatives(symbol: str) -> dict:
     rate, its annualized form, next funding time, mark price and open interest (incl. USD value),
     plus cross-venue aggregates: OI-weighted funding consensus (annualized too), funding dispersion
     across venues (a stress/arbitrage signal) and total OI in USD. High positive funding = crowded
-    longs; rising OI = leverage building. Annualized figures assume an 8h funding interval (the
-    venues' default). Execution is spot-only, so this is sentiment only — not a trade.
+    longs; rising OI = leverage building. Each venue's REAL funding interval (1h/4h/8h, read from
+    the venue) is reported; `funding_rate_8h` and the cross-venue aggregates are normalized to an
+    8h-equivalent and annualized on each venue's own interval. `venue_status` / `unavailable_venues`
+    name any venue that failed or answered with an error. Execution is spot-only, so this is
+    sentiment only — not a trade.
     """
     svc = services()
     if svc.crypto_derivatives is None:

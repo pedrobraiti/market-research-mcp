@@ -9,9 +9,11 @@ Two honesty rules live here:
 
 - Every returned history is stamped with ``source`` (which upstream actually served the bars),
   so downstream provenance claims (e.g. "yfinance split/div-adjusted closes") stay truthful.
-- If the primary raised ``SourceUnavailable`` (429/timeout after retries) and the fallback could
-  not deliver bars either, that exception is RE-RAISED — a rate-limited read must never collapse
-  into a ``None`` that reads as "this symbol has no data".
+- If the primary FAILED (any exception — a 429 after retries, a schema change, a crash) and the
+  fallback could not deliver bars either, a ``PriceHistoryUnavailable`` is raised carrying BOTH
+  causes — the primary's first, since it is the real story. A failed read must never collapse into
+  a ``None`` that reads as "this symbol has no data" (and so into an ``ok: true`` envelope).
+  Only a primary that genuinely ANSWERED "no bars" may end in ``None``.
 """
 
 from __future__ import annotations
@@ -20,7 +22,46 @@ from datetime import date
 from typing import Any
 
 from ..domain.models import PriceHistory
-from .retry import SourceUnavailable
+from .retry import ERROR, SourceUnavailable, classify_transient
+
+
+def _describe(exc: Exception) -> str:
+    if isinstance(exc, SourceUnavailable):
+        return str(exc)
+    return f"unavailable: {classify_transient(exc) or ERROR} — {type(exc).__name__}: {exc}"
+
+
+class PriceHistoryUnavailable(SourceUnavailable):
+    """Neither the primary nor the fallback produced bars, and the primary FAILED (not empty).
+
+    ``reason`` is the primary's (so a throttled primary stays ``rate_limited``); the message names
+    each source and its cause, so the tool envelope shows the whole chain, not a bare null.
+    """
+
+    def __init__(
+        self,
+        primary_name: str,
+        primary_error: Exception,
+        fallback_name: str,
+        fallback_error: Exception | None,
+    ) -> None:
+        self.primary_error = primary_error
+        self.fallback_error = fallback_error
+        reason = (
+            primary_error.reason
+            if isinstance(primary_error, SourceUnavailable)
+            else classify_transient(primary_error) or ERROR
+        )
+        fallback_outcome = (
+            f"failed ({_describe(fallback_error)})"
+            if fallback_error is not None
+            else "returned no bars"
+        )
+        super().__init__(
+            reason,
+            f"{primary_name} failed ({_describe(primary_error)}); "
+            f"{fallback_name} fallback {fallback_outcome}",
+        )
 
 
 class PriceFallbackMarketData:
@@ -53,17 +94,20 @@ class PriceFallbackMarketData:
             return self._stamped(primary_result, self._primary_name)
 
         fallback_result: PriceHistory | None = None
+        fallback_error: Exception | None = None
         try:
             fallback_result = await self._fallback.get_price_history(symbol, range, interval, as_of)
-        except Exception:  # noqa: BLE001 — the fallback failing must not mask the primary's story
-            fallback_result = None
+        except Exception as exc:  # noqa: BLE001 — kept as context, never masks the primary's story
+            fallback_error = exc
         if fallback_result is not None and fallback_result.bars:
             return self._stamped(fallback_result, self._fallback_name)
 
-        # No bars from either side. If the primary was UNAVAILABLE (rate-limited/timed out),
-        # surface that — "couldn't fetch" and "fetched, symbol has no data" must stay distinct.
-        if isinstance(primary_error, SourceUnavailable):
-            raise primary_error
+        # No bars from either side. If the primary FAILED, surface it (with the fallback's cause) —
+        # "couldn't fetch" and "fetched, symbol has no data" must stay distinct.
+        if primary_error is not None:
+            raise PriceHistoryUnavailable(
+                self._primary_name, primary_error, self._fallback_name, fallback_error
+            ) from primary_error
         if fallback_result is not None:
             return self._stamped(fallback_result, self._fallback_name)
         return self._stamped(primary_result, self._primary_name)

@@ -316,3 +316,128 @@ async def test_cfnai_recession_signal_threshold():
     expansion = {"CFNAIMA3": _daily_csv("CFNAIMA3", _END, [-0.50])}
     d = (await FredMacro(fetch_csv=_fetch_factory(expansion)).get_macro_context()).derived
     assert d.cfnai_recession_signal is False  # −0.50 not below −0.70
+
+
+# --- Temporal provenance (audit item 6): each input's observation date + staleness -----------
+
+_TODAY = date(2026, 10, 12)  # the real FRED last-observation dates below were read on this day
+_CPI_3PCT_YOY = [round(300 + 0.75 * i, 2) for i in range(13)]  # 13 prints, exactly +3.0% YoY
+
+
+def _real_csv(series: str, points: list[tuple[str, str]]) -> str:
+    """A fredgraph CSV exactly as FRED serves it today (``observation_date`` header)."""
+    return f"observation_date,{series}\n" + "".join(f"{d},{v}\n" for d, v in points)
+
+
+def _macro(store, today=_TODAY) -> FredMacro:
+    return FredMacro(fetch_csv=_fetch_factory(store), today=lambda: today)
+
+
+async def test_indicators_report_frequency_age_and_staleness():
+    store = {
+        # Real last observations on 2026-10-12: CPI 2026-08-01 (current — Sept CPI not out yet).
+        "CPIAUCSL": _real_csv("CPIAUCSL", [("2026-08-01", "334.131")]),
+        "RRPONTSYD": _real_csv("RRPONTSYD", [("2026-10-09", "0.300")]),
+        # A weekly series two months old is stale.
+        "WALCL": _real_csv("WALCL", [("2026-08-05", "6747560")]),
+    }
+    by_id = {i.series_id: i for i in (await _macro(store).get_macro_context()).indicators}
+    assert by_id["CPIAUCSL"].frequency == "monthly"
+    assert by_id["CPIAUCSL"].age_days == 72
+    assert by_id["CPIAUCSL"].stale is False
+    assert by_id["RRPONTSYD"].frequency == "daily"
+    assert by_id["RRPONTSYD"].stale is False
+    assert by_id["WALCL"].frequency == "weekly"
+    assert by_id["WALCL"].age_days == 68
+    assert by_id["WALCL"].stale is True
+
+
+async def test_composite_flags_stale_input_without_refusing():
+    # real_10y = DGS10 (fresh) − CPI YoY. CPI stuck at May (164 days old) must be NAMED, while the
+    # figure is still computed (annotate, don't refuse).
+    store = {
+        "CPIAUCSL": _monthly_csv("CPIAUCSL", 2025, 5, _CPI_3PCT_YOY),
+        "DGS10": _real_csv("DGS10", [("2026-10-07", "5.20"), ("2026-10-08", "5.22")]),
+    }
+    d = (await _macro(store).get_macro_context()).derived
+    assert d.real_10y == Decimal("2.22")  # 5.22 − 3.0
+    assert d.inputs_as_of["real_10y"] == {
+        "DGS10": date(2026, 10, 8),
+        "CPIAUCSL": date(2026, 5, 1),
+    }
+    assert d.stale_inputs["real_10y"] == ["CPIAUCSL"]
+    assert d.stale_inputs["cpi_yoy"] == ["CPIAUCSL"]
+    assert any("CPIAUCSL" in n and "stale" in n and "real_10y" in n for n in d.notes)
+
+
+async def test_current_inputs_leave_no_stale_flags():
+    store = {
+        "CPIAUCSL": _monthly_csv("CPIAUCSL", 2025, 8, _CPI_3PCT_YOY),
+        "DGS10": _real_csv("DGS10", [("2026-10-08", "5.22")]),
+        "FEDFUNDS": _real_csv("FEDFUNDS", [("2026-09-01", "3.75")]),
+    }
+    d = (await _macro(store).get_macro_context()).derived
+    assert d.real_fed_funds is not None and d.real_10y is not None
+    assert d.inputs_as_of["real_fed_funds"]["FEDFUNDS"] == date(2026, 9, 1)
+    assert d.stale_inputs == {}
+    assert not any("stale input" in n for n in d.notes)
+
+
+async def test_net_liquidity_flags_rrp_carried_forward_from_weeks_before_walcl():
+    # WALCL/TGA are current weekly prints, but the daily RRP stopped on 2026-09-01: carrying it
+    # forward onto the 2026-10-07 balance sheet silently mixes a 5-week-old leg → flag it.
+    weeks = ["2026-09-16", "2026-09-23", "2026-09-30", "2026-10-07"]
+    store = {
+        "WALCL": _real_csv("WALCL", [(d, "6747560") for d in weeks]),
+        "WTREGEN": _real_csv("WTREGEN", [(d, "880253") for d in weeks]),
+        "RRPONTSYD": _real_csv("RRPONTSYD", [("2026-08-31", "0.5"), ("2026-09-01", "0.3")]),
+    }
+    d = (await _macro(store).get_macro_context()).derived
+    assert d.net_liquidity == Decimal("5867007")  # 6,747,560 − 880,253 − 0.3×1000
+    assert d.inputs_as_of["net_liquidity"] == {
+        "WALCL": date(2026, 10, 7),
+        "WTREGEN": date(2026, 10, 7),
+        "RRPONTSYD": date(2026, 9, 1),
+    }
+    assert d.stale_inputs["net_liquidity"] == ["RRPONTSYD"]
+    assert d.stale_inputs["net_liquidity_wow"] == ["RRPONTSYD"]
+
+
+async def test_same_cadence_spread_uses_the_latest_common_date():
+    # Brent printed on 10-06 but WTI's last print is 10-05: the spread must be 10-05 vs 10-05,
+    # not Brent(10-06) − WTI(10-05).
+    store = {
+        "DCOILBRENTEU": _real_csv("DCOILBRENTEU", [("2026-10-05", "80.0"), ("2026-10-06", "90.0")]),
+        "DCOILWTICO": _real_csv("DCOILWTICO", [("2026-10-05", "76.0")]),
+    }
+    d = (await _macro(store).get_macro_context()).derived
+    assert d.brent_wti_spread == Decimal("4.0")
+    assert d.inputs_as_of["brent_wti_spread"] == {
+        "DCOILBRENTEU": date(2026, 10, 5),
+        "DCOILWTICO": date(2026, 10, 5),
+    }
+
+
+async def test_html_served_with_200_is_blocked_not_a_silent_null():
+    store = dict(_CSV)
+    store["VIXCLS"] = "<!DOCTYPE html>\n<html><head><title>Access denied</title></head></html>\n"
+    store["DGS2"] = "error,message\nrate limit,try later\n"
+    by_id = {i.series_id: i for i in (await _macro(store).get_macro_context()).indicators}
+    assert by_id["VIXCLS"].value is None
+    assert by_id["VIXCLS"].status == "unavailable: blocked"
+    assert by_id["DGS2"].status == "unavailable: schema_error"
+    assert by_id["FEDFUNDS"].status is None
+
+
+async def test_as_of_measures_age_against_as_of_and_says_it_is_observation_date():
+    snapshot = await _macro(_CSV).get_macro_context(as_of=date(2026, 6, 25))
+    by_id = {i.series_id: i for i in snapshot.indicators}
+    assert by_id["DGS10"].age_days == 0
+    assert by_id["DGS10"].stale is False
+    assert any("observation date, not publication date" in n for n in snapshot.derived.notes)
+
+
+def test_every_series_has_a_staleness_limit():
+    from scout.adapters.fred.macro import _SERIES, stale_after_days
+
+    assert all(stale_after_days(series_id) is not None for series_id, _ in _SERIES)

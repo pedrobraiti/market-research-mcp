@@ -4,17 +4,33 @@ stooq has no real API, but exposes daily OHLCV as a CSV download with no key. It
 **fallback** for price history when yfinance (a scraper) fails or rate-limits — resilience, not a
 new signal. Daily only; intraday returns ``None`` so the caller keeps the primary source's result.
 
-The CSV fetch is injected for offline tests.
+Two outcomes must never be confused (ADR-012):
+
+- **"symbol has no data"** — stooq's own ``No data`` body, or a valid CSV with no bars in range →
+  ``None``.
+- **"couldn't read stooq"** — HTTP 200 carrying an HTML page / JavaScript bot challenge (observed
+  live 2026-10-10), the daily-hits-limit notice, an empty body or a CSV whose header changed →
+  ``SourceUnavailable`` with a ``blocked`` / ``rate_limited`` / ``schema_error`` reason.
+
+The CSV fetch is injected for offline tests (``transport`` lets a test drive the real httpx path).
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
+from typing import Any
 
 from ...domain.models import PriceBar, PriceHistory
+from ..retry import BLOCKED, RATE_LIMITED, SCHEMA_ERROR, SourceUnavailable
 
 _CSV_URL = "https://stooq.com/q/d/l/?s={symbol}.us&i=d"
+
+# stooq's documented answer for an unknown symbol — the only body that means "genuinely no data".
+_NO_DATA_BODY = "no data"
+_HITS_LIMIT_MARKER = "exceeded the daily hits limit"
+_CHALLENGE_MARKERS = ("requires javascript", "/__verify", "crypto.subtle")
+_BODY_PREFIX_CHARS = 120
 
 # Approximate calendar days per range token.
 _RANGE_DAYS = {
@@ -30,6 +46,33 @@ def _to_decimal(value: str):
         return Decimal(value)
     except (InvalidOperation, ValueError):
         return None
+
+
+def _body_prefix(text: str) -> str:
+    return " ".join(text.split())[:_BODY_PREFIX_CHARS]
+
+
+def _raise_if_unreadable(text: str) -> None:
+    """Raise ``SourceUnavailable`` unless ``text`` is a stooq CSV or stooq's own ``No data``."""
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if lowered.startswith(_NO_DATA_BODY):
+        return
+    if not stripped:
+        raise SourceUnavailable(SCHEMA_ERROR, "stooq returned an empty body instead of CSV")
+    if lowered.startswith("<") or "<html" in lowered[:500]:
+        kind = (
+            "a JavaScript bot challenge"
+            if any(marker in lowered for marker in _CHALLENGE_MARKERS)
+            else "an HTML page"
+        )
+        raise SourceUnavailable(BLOCKED, f"stooq returned {kind} instead of CSV")
+    if _HITS_LIMIT_MARKER in lowered:
+        raise SourceUnavailable(RATE_LIMITED, f"stooq: {_body_prefix(stripped)}")
+    if not lowered.startswith("date"):
+        raise SourceUnavailable(
+            SCHEMA_ERROR, f"stooq CSV header not recognised: {_body_prefix(stripped)!r}"
+        )
 
 
 def _parse(symbol: str, csv_text: str, range_: str, as_of: date | None) -> PriceHistory | None:
@@ -70,8 +113,10 @@ class StooqPrices:
         self,
         fetch_csv: Callable[[str], Awaitable[str]] | None = None,
         timeout: float = 15.0,
+        transport: Any = None,
     ) -> None:
         self._timeout = timeout
+        self._transport = transport
         self._fetch_csv = fetch_csv or self._default_fetch_csv
 
     async def _default_fetch_csv(self, url: str) -> str:
@@ -84,7 +129,10 @@ class StooqPrices:
             )
         }
         async with httpx.AsyncClient(
-            timeout=self._timeout, headers=headers, follow_redirects=True
+            timeout=self._timeout,
+            headers=headers,
+            follow_redirects=True,
+            transport=self._transport,
         ) as client:
             response = await client.get(url)
             response.raise_for_status()
@@ -97,4 +145,5 @@ class StooqPrices:
             return None
         clean = symbol.strip().lower()
         text = await self._fetch_csv(_CSV_URL.format(symbol=clean))
+        _raise_if_unreadable(text)
         return _parse(symbol.strip().upper(), text, range, as_of)

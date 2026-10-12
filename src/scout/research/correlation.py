@@ -13,6 +13,7 @@ from datetime import date
 from ..analytics import pct_returns, pearson
 from ..domain.models import CorrelationMatrix
 from ..domain.ports import MarketDataSource
+from .notes import unavailable_or_not_found
 
 
 async def build_correlation(
@@ -31,7 +32,7 @@ async def build_correlation(
     closes_by_date: dict[str, dict[date, float]] = {}
     for symbol, history in zip(clean, histories, strict=False):
         if isinstance(history, Exception) or history is None or not history.bars:
-            notes.append(f"{symbol}: price history unavailable")
+            notes.append(f"{symbol}: price history {unavailable_or_not_found(history)}")
             continue
         closes_by_date[symbol] = {
             b.date: float(b.close) for b in history.bars if b.close is not None

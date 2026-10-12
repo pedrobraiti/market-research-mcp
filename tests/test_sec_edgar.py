@@ -1,6 +1,10 @@
 from datetime import date
 from decimal import Decimal
 
+import httpx
+import pytest
+
+from scout.adapters.retry import SourceUnavailable
 from scout.adapters.sec import SecEdgar
 
 _TICKERS = {
@@ -76,6 +80,20 @@ _FTS = {
 }
 
 
+def _http_error(status: int, url: str, body: bytes) -> httpx.HTTPStatusError:
+    """The exact exception the default httpx fetcher raises (``raise_for_status``)."""
+    request = httpx.Request("GET", url)
+    response = httpx.Response(status, request=request, content=body)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+
+# What SEC really serves an undeclared User-Agent (probed 2026-10-12): HTTP 403 + an HTML page.
+_UNDECLARED_AGENT_HTML = (
+    b'<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN">\n<html><head>'
+    b"<title>SEC.gov | Your Request Originates from an Undeclared Automated Tool</title>"
+)
+
+
 def _fetch_factory():
     async def _fetch(url: str) -> dict:
         if "company_tickers" in url:
@@ -86,7 +104,7 @@ def _fetch_factory():
             tag = url.rsplit("/", 1)[-1].removesuffix(".json")
             if tag in _CONCEPTS:
                 return _CONCEPTS[tag]
-            raise RuntimeError("404 — tag not used by this filer")
+            raise _http_error(404, url, b"<Error><Code>NoSuchKey</Code></Error>")
         return _SUBMISSIONS
 
     return _fetch
@@ -188,3 +206,74 @@ async def test_search_filings_parses_hits():
     assert hit.url == (
         "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm"
     )
+
+
+# ---- explicit failure: unset identity / unreadable SEC (audit item 6) ------------------
+
+
+async def test_unset_user_agent_sends_no_request(monkeypatch):
+    def no_network(*args, **kwargs):
+        raise AssertionError("an anonymous request reached the network")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_network)
+    with pytest.raises(SourceUnavailable) as excinfo:
+        await SecEdgar("   ").get_financials("AAPL")
+    assert excinfo.value.status == "unavailable: misconfigured"
+    assert "SCOUT_SEC_USER_AGENT" in str(excinfo.value)
+
+
+def _concepts_fail_with(status: int, body: bytes = b""):
+    async def _fetch(url: str) -> dict:
+        if "company_tickers" in url:
+            return _TICKERS
+        raise _http_error(status, url, body)
+
+    return _fetch
+
+
+async def test_unreadable_concepts_carry_status_not_six_silent_nulls():
+    # Ticker map cached, but every XBRL concept answers 403 — previously six null lines with no
+    # status, indistinguishable from "the company reports nothing".
+    source = SecEdgar("Test Agent test@example.com", fetch_json=_concepts_fail_with(
+        403, _UNDECLARED_AGENT_HTML
+    ))
+    financials = await source.get_financials("AAPL")
+    assert financials is not None
+    assert len(financials.lines) == 6
+    assert all(line.value is None for line in financials.lines)
+    assert all(line.status.startswith("unavailable: blocked") for line in financials.lines)
+    assert financials.status.startswith("unavailable: blocked")
+    assert "SCOUT_SEC_USER_AGENT" in financials.status
+
+
+async def test_rate_limited_concepts_are_unavailable():
+    source = SecEdgar("Test Agent test@example.com", fetch_json=_concepts_fail_with(429))
+    financials = await source.get_financials("AAPL")
+    assert financials.status.startswith("unavailable: rate_limited")
+
+
+async def test_not_reported_is_distinct_from_unavailable():
+    base = _fetch_factory()
+
+    async def _fetch(url: str) -> dict:
+        if url.endswith("/GrossProfit.json"):
+            raise _http_error(404, url, b"<Error><Code>NoSuchKey</Code></Error>")
+        if url.endswith("/OperatingIncomeLoss.json"):
+            raise _http_error(429, url, b"")
+        return await base(url)
+
+    financials = await SecEdgar("Test Agent test@example.com", fetch_json=_fetch).get_financials(
+        "AAPL"
+    )
+    by_concept = {line.concept: line for line in financials.lines}
+    assert by_concept["gross_profit"].status == "not_reported"
+    assert by_concept["operating_income"].status.startswith("unavailable: rate_limited")
+    assert by_concept["revenue"].status is None  # found (via the fallback tag)
+    assert financials.status == "partial: operating_income unavailable"
+    assert financials.fiscal_year == 2024  # the readable lines are still delivered
+
+
+async def test_fully_read_financials_have_no_status():
+    financials = await _source().get_financials("AAPL")
+    assert financials.status is None
+    assert all(line.status is None for line in financials.lines)
