@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Pedro Braiti" }]
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2,<2",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
